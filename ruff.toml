@@ -1,0 +1,6 @@
+target-version = "py39"
+line-length = 120
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["UP006", "UP007", "UP035", "UP045"]  # keep typing.List/Optional for 3.9 readability

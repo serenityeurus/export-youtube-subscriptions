@@ -1,0 +1,3 @@
+# Runtime deps (also declared inline in the export-youtube-subscriptions script for `uv run`).
+google-api-python-client>=2.0
+google-auth-oauthlib>=1.0

@@ -1,0 +1,20 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#   "google-api-python-client>=2.0",
+#   "google-auth-oauthlib>=1.0",
+# ]
+# ///
+"""Entry point. Run directly (uses uv + the inline deps above), or with any
+Python that has requirements.txt installed: ``python3 export-youtube-subscriptions``."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from export_youtube_subscriptions import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

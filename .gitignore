@@ -7,3 +7,13 @@ __pycache__/
 .venv/
 dist/
 build/
+
+# OAuth secrets / tokens: never commit
+client_secret*.json
+token.json
+*.token.json
+
+# Generated exports (keep them out of this repo; point --output-dir elsewhere)
+/musicians.md
+/youtubers.md
+/overrides.txt
