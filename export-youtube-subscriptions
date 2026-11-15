@@ -12,9 +12,12 @@ Python that has requirements.txt installed: ``python3 export-youtube-subscriptio
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+# realpath: a symlink in ~/bin still finds the module and the
+# export-youtube-subscriptions.env that live next to the real script.
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 
 from export_youtube_subscriptions import main  # noqa: E402
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(script_dir=SCRIPT_DIR))

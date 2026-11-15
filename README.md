@@ -45,9 +45,10 @@ On the first run, a browser opens for Google sign-in. Use `--no-browser` on a he
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--output-dir DIR` | `.` | Where `musicians.md`, `youtubers.md` and `overrides.txt` live |
-| `--client-secrets PATH` | `client_secret.json` | OAuth Desktop client JSON |
-| `--token PATH` | `~/.config/export-youtube-subscriptions/token.json` | Cached OAuth token |
+| `--output-dir DIR` | `$EYS_OUTPUT_DIR`, else `.` | Where `musicians.md`, `youtubers.md` and `overrides.txt` live. Created if missing |
+| `--client-secrets PATH` | `$EYS_CLIENT_SECRETS`, else `client_secret.json` | OAuth Desktop client JSON |
+| `--token PATH` | `$EYS_TOKEN_PATH`, else `~/.config/export-youtube-subscriptions/token.json` | Cached OAuth token |
+| `--env-file PATH` | see [Env file](#env-file) | Settings file to read |
 | `--no-browser` | off | Print the auth URL instead of opening a browser |
 | `--dry-run` | off | Compute and print the summary without writing anything |
 | `--allow-empty` | off | Accept an empty subscription list (see Safety) |
@@ -55,9 +56,11 @@ On the first run, a browser opens for Google sign-in. Use `--no-browser` on a he
 | `--from-json PATH` | none | Read subscriptions from a JSON fixture instead of the API (for testing) |
 | `--date YYYY-MM-DD` | today | Date to use in new markers (for testing) |
 
-Every run prints a summary for each file, for example:
+Every run prints which env file was loaded, the resolved output directory and where it came from, then a summary for each file, for example:
 
 ```
+env file: /Users/jay/.config/export-youtube-subscriptions/export-youtube-subscriptions.env
+output dir: /Users/jay/notes/pages (from EYS_OUTPUT_DIR in /Users/jay/.config/export-youtube-subscriptions/export-youtube-subscriptions.env)
 fetched 7 subscriptions
 musicians.md: 5 channels, +2 added, 0 newly missing, 0 still missing, 0 restored, 0 renamed
 youtubers.md: 3 channels, +0 added, 1 newly missing, 0 still missing, 0 restored, 0 renamed
@@ -67,9 +70,47 @@ Exit codes:
 
 - `0`: success
 - `1`: API, auth or network error. No files are touched.
-- `2`: usage or config error, a bad `overrides.txt`, or the empty-list safety guard tripped.
+- `2`: usage or config error (bad or missing env file, output dir that can't be created), a bad `overrides.txt`, or the empty-list safety guard tripped.
 
 The `--from-json` fixture is a JSON list of `{"id", "title", "topicIds"?, "topicCategories"?}`.
+
+## Env file
+
+Settings can live in `export-youtube-subscriptions.env`, so cron/launchd runs don't need flags. Start from the committed example; the real file is gitignored:
+
+```sh
+cp export-youtube-subscriptions.env.example export-youtube-subscriptions.env
+# then edit: EYS_OUTPUT_DIR=~/notes/pages
+./export-youtube-subscriptions
+```
+
+| Key | Default for | Built-in default |
+|---|---|---|
+| `EYS_OUTPUT_DIR` | `--output-dir` | current directory |
+| `EYS_CLIENT_SECRETS` | `--client-secrets` | `client_secret.json` |
+| `EYS_TOKEN_PATH` | `--token` | `~/.config/export-youtube-subscriptions/token.json` |
+
+**Which file is read.** The first one found, and only that one:
+
+1. `--env-file PATH`
+2. `$EYS_ENV_FILE`
+3. `export-youtube-subscriptions.env` in the directory of the executable, with symlinks resolved (a `~/bin` symlink finds the file next to the real script)
+4. `~/.config/export-youtube-subscriptions/export-youtube-subscriptions.env` (`$XDG_CONFIG_HOME` is honoured)
+
+If no file is found, that's fine and the built-in defaults apply. A file named with `--env-file` or `$EYS_ENV_FILE` must exist, so a typo fails with exit code 2 instead of silently writing to the wrong place.
+
+**Precedence for each setting:** CLI flag > real environment variable (`EYS_OUTPUT_DIR=... ./export-youtube-subscriptions`) > env file > built-in default. An empty value counts as unset at every level.
+
+**Syntax.** A small, stdlib-parsed subset of dotenv:
+
+- `KEY=VALUE`, one per line. Blank lines and lines starting with `#` are ignored. A leading `export ` is allowed, so the file can also be `source`d.
+- In an unquoted value, ` #` (whitespace, then `#`) starts a comment. `a#b` keeps its `#`.
+- `"double quotes"` expand `~` and `$HOME`. `'single quotes'` are literal. Unquoted values expand `~` and `$HOME` too.
+- Only `~`, `$HOME` and `${HOME}` are expanded. Other `$VARS` are not, so the meaning of the file doesn't depend on whatever environment cron happens to provide.
+- Relative paths are resolved against the env file's directory, not the current directory.
+- If a key appears twice, the last one wins. Unknown keys produce a warning, which catches typos like `EYS_OUTPUT_DIRS`. A malformed line stops the run with `file:line` and exit code 2.
+
+The output directory is created with `mkdir -p` after the subscriptions are fetched successfully. It is never created in `--dry-run` (the summary says it would be) or when the fetch fails. `-v` also prints the resolved client-secrets and token paths and where each came from.
 
 ## File format and re-run semantics
 
@@ -135,6 +176,7 @@ Layout:
 
 - `export_youtube_subscriptions.py`: all the logic (parse, classify, merge, atomic write, fetch, CLI).
 - `export-youtube-subscriptions`: the executable entry point, a uv script with inline dependencies.
+- `export-youtube-subscriptions.env.example`: documented settings template (copy to `export-youtube-subscriptions.env`).
 - `tests/test_export.py`: the tests.
 
 ## License

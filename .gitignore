@@ -13,6 +13,9 @@ client_secret*.json
 token.json
 *.token.json
 
+# Local settings (copy export-youtube-subscriptions.env.example)
+export-youtube-subscriptions.env
+
 # Generated exports (keep them out of this repo; point --output-dir elsewhere)
 /musicians.md
 /youtubers.md

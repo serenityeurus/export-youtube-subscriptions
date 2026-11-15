@@ -343,10 +343,28 @@ class FetchTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def run_cli(self, *argv, fetch=None):
+    """main() runs with an injected empty environment and script dir so a real
+    export-youtube-subscriptions.env on the dev box can never leak in."""
+
+    def setUp(self):
+        self._sandbox = tempfile.TemporaryDirectory()
+        self.sandbox = self._sandbox.name
+        self.env = {"HOME": os.path.join(self.sandbox, "home")}
+        self.script_dir = os.path.join(self.sandbox, "bin")
+        os.makedirs(self.script_dir)
+
+    def tearDown(self):
+        self._sandbox.cleanup()
+
+    def run_cli(self, *argv, fetch=None, environ=None):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = eys.main(list(argv), fetch=fetch)
+            code = eys.main(
+                list(argv),
+                fetch=fetch,
+                environ=self.env if environ is None else environ,
+                script_dir=self.script_dir,
+            )
         return code, out.getvalue(), err.getvalue()
 
     def test_end_to_end_from_json(self):
@@ -408,6 +426,108 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("client secrets not found", err)
 
+    # ---- env file integration -------------------------------------------
+
+    def write_env(self, path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_output_dir_from_env_file_next_to_executable_and_created(self):
+        target = os.path.join(self.sandbox, "notes", "pages")  # does not exist yet
+        envf = self.write_env(
+            os.path.join(self.script_dir, eys.ENV_FILENAME), f"EYS_OUTPUT_DIR={target}\n"
+        )
+        code, out, _ = self.run_cli("--date", TODAY, fetch=lambda: [ch("UCm", "A - Topic")])
+        self.assertEqual(code, 0)
+        self.assertIn(f"env file: {envf}", out)
+        self.assertIn(f"output dir: {target} (from EYS_OUTPUT_DIR in {envf}, created)", out)
+        self.assertTrue(os.path.isfile(os.path.join(target, "musicians.md")))
+
+    def test_dry_run_does_not_create_output_dir(self):
+        target = os.path.join(self.sandbox, "nope")
+        self.write_env(os.path.join(self.script_dir, eys.ENV_FILENAME), f"EYS_OUTPUT_DIR={target}\n")
+        code, out, _ = self.run_cli("--dry-run", fetch=lambda: [ch("UCa", "A")])
+        self.assertEqual(code, 0)
+        self.assertIn("would be created", out)
+        self.assertFalse(os.path.exists(target))
+
+    def test_fetch_failure_does_not_create_output_dir(self):
+        target = os.path.join(self.sandbox, "nope")
+
+        def boom():
+            raise RuntimeError("x")
+
+        code, _, _ = self.run_cli("--output-dir", target, fetch=boom)
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(target))
+
+    def test_nested_output_dir_mkdir_p(self):
+        target = os.path.join(self.sandbox, "a", "b", "c")
+        code, _, _ = self.run_cli("--output-dir", target, fetch=lambda: [ch("UCa", "A")])
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(os.path.join(target, "youtubers.md")))
+
+    def test_output_dir_is_a_file(self):
+        f = os.path.join(self.sandbox, "file")
+        open(f, "w").close()
+        code, _, err = self.run_cli("--output-dir", f, fetch=lambda: [ch("UCa", "A")])
+        self.assertEqual(code, 2)
+        self.assertIn("not a directory", err)
+
+    def test_no_env_file_falls_back_to_cwd(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.getcwd()
+            os.chdir(d)
+            try:
+                code, out, _ = self.run_cli("--dry-run", fetch=lambda: [ch("UCa", "A")])
+            finally:
+                os.chdir(old)
+            self.assertEqual(code, 0)
+            self.assertIn("env file: none", out)
+            self.assertIn("(from default", out)
+
+    def test_cli_flag_beats_env_beats_file(self):
+        self.write_env(os.path.join(self.script_dir, eys.ENV_FILENAME), "EYS_OUTPUT_DIR=/from/file\n")
+        env_dir = os.path.join(self.sandbox, "env")
+        flag_dir = os.path.join(self.sandbox, "flag")
+        env = dict(self.env, EYS_OUTPUT_DIR=env_dir)
+        _, out, _ = self.run_cli("--dry-run", fetch=lambda: [], environ=env)
+        self.assertIn(f"output dir: {env_dir} (from $EYS_OUTPUT_DIR", out)
+        _, out, _ = self.run_cli("--dry-run", "--output-dir", flag_dir, fetch=lambda: [], environ=env)
+        self.assertIn(f"output dir: {flag_dir} (from --output-dir", out)
+
+    def test_explicit_env_file_missing_is_error(self):
+        code, _, err = self.run_cli("--env-file", os.path.join(self.sandbox, "missing.env"), fetch=lambda: [])
+        self.assertEqual(code, 2)
+        self.assertIn("--env-file", err)
+        env = dict(self.env, EYS_ENV_FILE=os.path.join(self.sandbox, "missing.env"))
+        code, _, err = self.run_cli(fetch=lambda: [], environ=env)
+        self.assertEqual(code, 2)
+        self.assertIn("$EYS_ENV_FILE", err)
+
+    def test_malformed_env_file_is_error(self):
+        self.write_env(os.path.join(self.script_dir, eys.ENV_FILENAME), "this is not valid\n")
+        code, _, err = self.run_cli(fetch=lambda: [])
+        self.assertEqual(code, 2)
+        self.assertIn(":1: expected KEY=VALUE", err)
+
+    def test_unknown_key_warns(self):
+        self.write_env(os.path.join(self.script_dir, eys.ENV_FILENAME), "EYS_OUTPUT_DIRS=/typo\n")
+        code, _, err = self.run_cli("--dry-run", fetch=lambda: [])
+        self.assertEqual(code, 0)
+        self.assertIn("unknown key(s): EYS_OUTPUT_DIRS", err)
+
+    def test_verbose_shows_secrets_and_token_sources(self):
+        self.write_env(
+            os.path.join(self.script_dir, eys.ENV_FILENAME),
+            "EYS_CLIENT_SECRETS=/s/cs.json\nEYS_TOKEN_PATH=/s/tok.json\n",
+        )
+        _, out, _ = self.run_cli("--dry-run", "-v", "--output-dir", self.sandbox, fetch=lambda: [])
+        self.assertIn("client secrets: /s/cs.json (from EYS_CLIENT_SECRETS in", out)
+        self.assertIn("token: /s/tok.json (from EYS_TOKEN_PATH in", out)
+
     def test_default_token_path_xdg(self):
         old = os.environ.get("XDG_CONFIG_HOME")
         os.environ["XDG_CONFIG_HOME"] = "/tmp/xdg"
@@ -420,6 +540,188 @@ class CliTests(unittest.TestCase):
                 del os.environ["XDG_CONFIG_HOME"]
             else:
                 os.environ["XDG_CONFIG_HOME"] = old
+
+
+class EnvParseTests(unittest.TestCase):
+    ENV = {"HOME": "/home/jay"}
+
+    def parse(self, text):
+        return eys.parse_env_file(text, self.ENV)
+
+    def test_basic_comments_blanks(self):
+        self.assertEqual(
+            self.parse("# c\n\n  EYS_OUTPUT_DIR = /x/y  \n   # indented comment\nB=2\n"),
+            {"EYS_OUTPUT_DIR": "/x/y", "B": "2"},
+        )
+
+    def test_quotes(self):
+        v = self.parse('A="/a b/c"\nB=\'/lit $HOME ~\'\nC="~/q"  # trailing\nD=""\n')
+        self.assertEqual(v, {"A": "/a b/c", "B": "/lit $HOME ~", "C": "/home/jay/q", "D": ""})
+
+    def test_home_expansion(self):
+        v = self.parse("A=~/notes/pages\nB=$HOME/x\nC=${HOME}/y\nD=~\nE=~other/z\nF=$HOMEX\n")
+        self.assertEqual(v["A"], "/home/jay/notes/pages")
+        self.assertEqual(v["B"], "/home/jay/x")
+        self.assertEqual(v["C"], "/home/jay/y")
+        self.assertEqual(v["D"], "/home/jay")
+        self.assertEqual(v["E"], "~other/z")  # ~user is not expanded
+        self.assertEqual(v["F"], "$HOMEX")  # only the HOME variable, word-bounded
+
+    def test_inline_comment_needs_whitespace(self):
+        self.assertEqual(self.parse("A=a#b # comment\n"), {"A": "a#b"})
+
+    def test_export_prefix_crlf_bom_last_wins(self):
+        v = self.parse("﻿export A=1\r\nA=2\r\nexport\tB=3")
+        self.assertEqual(v, {"A": "2", "B": "3"})
+
+    def test_equals_in_value(self):
+        self.assertEqual(self.parse("A=x=y\n"), {"A": "x=y"})
+
+    def test_empty_text(self):
+        self.assertEqual(self.parse(""), {})
+
+    def test_malformed(self):
+        for bad in ("NOEQUALS", "=v", "1A=v", "A B=v", 'A="unterminated', "A='x' junk"):
+            with self.assertRaises(eys.EnvFileError, msg=bad) as cm:
+                self.parse(f"# ok\n{bad}\n")
+            self.assertIn(":2:", str(cm.exception))
+
+
+class EnvLookupTests(unittest.TestCase):
+    def setUp(self):
+        self._d = tempfile.TemporaryDirectory()
+        self.d = self._d.name
+        self.home = os.path.join(self.d, "home")
+        self.script_dir = os.path.join(self.d, "bin")
+        self.cfg = os.path.join(self.home, ".config", "export-youtube-subscriptions")
+        for p in (self.script_dir, self.cfg):
+            os.makedirs(p)
+        self.env = {"HOME": self.home}
+
+    def tearDown(self):
+        self._d.cleanup()
+
+    def touch(self, path, text="EYS_OUTPUT_DIR=/x\n"):
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def find(self, cli=None, env=None):
+        return eys.find_env_file(cli, env if env is not None else self.env, self.script_dir)
+
+    def test_order(self):
+        self.assertIsNone(self.find())
+        cfg = self.touch(os.path.join(self.cfg, eys.ENV_FILENAME))
+        self.assertEqual(self.find(), cfg)
+        beside = self.touch(os.path.join(self.script_dir, eys.ENV_FILENAME))
+        self.assertEqual(self.find(), beside)
+        via_env = self.touch(os.path.join(self.d, "env.env"))
+        env = dict(self.env, EYS_ENV_FILE=via_env)
+        self.assertEqual(self.find(env=env), via_env)
+        via_flag = self.touch(os.path.join(self.d, "flag.env"))
+        self.assertEqual(self.find(cli=via_flag, env=env), via_flag)
+
+    def test_xdg_config_home(self):
+        xdg = os.path.join(self.d, "xdg", "export-youtube-subscriptions")
+        os.makedirs(xdg)
+        p = self.touch(os.path.join(xdg, eys.ENV_FILENAME))
+        self.assertEqual(self.find(env=dict(self.env, XDG_CONFIG_HOME=os.path.join(self.d, "xdg"))), p)
+
+    def test_empty_env_var_is_unset(self):
+        self.assertIsNone(self.find(env=dict(self.env, EYS_ENV_FILE="")))
+
+    def test_explicit_missing_raises(self):
+        with self.assertRaises(eys.EnvFileError):
+            self.find(cli=os.path.join(self.d, "nope.env"))
+        with self.assertRaises(eys.EnvFileError):
+            self.find(env=dict(self.env, EYS_ENV_FILE=os.path.join(self.d, "nope.env")))
+
+    def test_explicit_tilde(self):
+        p = self.touch(os.path.join(self.home, "my.env"))
+        self.assertEqual(self.find(cli="~/my.env"), p)
+
+    def test_directory_named_like_env_file_is_skipped(self):
+        os.makedirs(os.path.join(self.script_dir, eys.ENV_FILENAME))
+        self.assertIsNone(self.find())
+
+    def test_symlinked_executable_resolves_to_real_dir(self):
+        real = os.path.join(self.d, "real")
+        os.makedirs(real)
+        script = self.touch(os.path.join(real, "export-youtube-subscriptions"), "")
+        link = os.path.join(self.script_dir, "eys")
+        os.symlink(script, link)
+        envf = self.touch(os.path.join(real, eys.ENV_FILENAME))
+        resolved = os.path.dirname(os.path.realpath(link))
+        self.assertEqual(eys.find_env_file(None, self.env, resolved), os.path.realpath(envf))
+
+    def test_relative_paths_anchored_to_env_file_dir(self):
+        p = self.touch(
+            os.path.join(self.script_dir, eys.ENV_FILENAME),
+            "EYS_OUTPUT_DIR=out\nEYS_CLIENT_SECRETS=./cs.json\nEYS_TOKEN_PATH=/abs/t.json\nOTHER=rel\n",
+        )
+        v = eys.load_env_file(p, self.env)
+        self.assertEqual(v["EYS_OUTPUT_DIR"], os.path.join(self.script_dir, "out"))
+        self.assertEqual(v["EYS_CLIENT_SECRETS"], os.path.join(self.script_dir, "cs.json"))
+        self.assertEqual(v["EYS_TOKEN_PATH"], "/abs/t.json")
+        self.assertEqual(v["OTHER"], "rel")
+
+
+class SettingsPrecedenceTests(unittest.TestCase):
+    def setUp(self):
+        self._d = tempfile.TemporaryDirectory()
+        self.d = self._d.name
+        self.env = {"HOME": os.path.join(self.d, "home")}
+        with open(os.path.join(self.d, eys.ENV_FILENAME), "w") as f:
+            f.write("EYS_OUTPUT_DIR=/file/out\nEYS_CLIENT_SECRETS=/file/cs.json\nEYS_TOKEN_PATH=/file/t.json\n")
+
+    def tearDown(self):
+        self._d.cleanup()
+
+    def resolve(self, argv=(), env=None, script_dir=None):
+        args = eys.build_parser().parse_args(list(argv))
+        return eys.resolve_settings(args, env if env is not None else self.env,
+                                    script_dir if script_dir is not None else self.d)
+
+    def test_file_beats_default(self):
+        s = self.resolve()
+        self.assertEqual((s.output_dir, s.client_secrets, s.token_path),
+                         ("/file/out", "/file/cs.json", "/file/t.json"))
+        self.assertEqual(s.env_file, os.path.join(self.d, eys.ENV_FILENAME))
+
+    def test_env_beats_file(self):
+        env = dict(self.env, EYS_OUTPUT_DIR="/env/out", EYS_TOKEN_PATH="~/t.json")
+        s = self.resolve(env=env)
+        self.assertEqual(s.output_dir, "/env/out")
+        self.assertEqual(s.token_path, os.path.join(self.env["HOME"], "t.json"))
+        self.assertEqual(s.client_secrets, "/file/cs.json")
+        self.assertEqual(s.sources["output-dir"], "$EYS_OUTPUT_DIR")
+
+    def test_flag_beats_env(self):
+        env = dict(self.env, EYS_OUTPUT_DIR="/env/out")
+        s = self.resolve(["--output-dir", "/flag", "--client-secrets", "c.json", "--token", "t"], env=env)
+        self.assertEqual((s.output_dir, s.client_secrets, s.token_path), ("/flag", "c.json", "t"))
+        self.assertEqual(s.sources["output-dir"], "--output-dir")
+
+    def test_empty_values_are_unset(self):
+        env = dict(self.env, EYS_OUTPUT_DIR="")
+        self.assertEqual(self.resolve(env=env).output_dir, "/file/out")
+        self.assertEqual(self.resolve(["--output-dir", ""], env=env).output_dir, "/file/out")
+
+    def test_builtin_defaults_without_file(self):
+        with tempfile.TemporaryDirectory() as empty:
+            s = self.resolve(script_dir=empty)
+        self.assertEqual(s.env_file, None)
+        self.assertEqual(s.output_dir, ".")
+        self.assertEqual(s.client_secrets, "client_secret.json")
+        self.assertEqual(
+            s.token_path, os.path.join(self.env["HOME"], ".config", "export-youtube-subscriptions", "token.json")
+        )
+        self.assertEqual(set(s.sources.values()), {"default"})
+
+    def test_single_quoted_file_value_stays_literal(self):
+        with open(os.path.join(self.d, eys.ENV_FILENAME), "w") as f:
+            f.write("EYS_OUTPUT_DIR='/lit/~'\n")
+        self.assertEqual(self.resolve().output_dir, "/lit/~")
 
 
 if __name__ == "__main__":

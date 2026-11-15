@@ -472,9 +472,8 @@ def load_json_channels(path: str) -> List[Channel]:
     ]
 
 
-def default_token_path() -> str:
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "export-youtube-subscriptions", "token.json")
+def default_token_path(environ=None) -> str:
+    return os.path.join(config_dir(environ), "token.json")
 
 
 def _save_token(path: str, creds) -> None:
@@ -523,6 +522,198 @@ def fetch_from_api(client_secrets: str, token_path: str, open_browser: bool = Tr
 
 
 # --------------------------------------------------------------------------
+# Env file (export-youtube-subscriptions.env)
+# --------------------------------------------------------------------------
+
+ENV_FILENAME = "export-youtube-subscriptions.env"
+ENV_FILE_VAR = "EYS_ENV_FILE"
+ENV_OUTPUT_DIR = "EYS_OUTPUT_DIR"
+ENV_CLIENT_SECRETS = "EYS_CLIENT_SECRETS"
+ENV_TOKEN_PATH = "EYS_TOKEN_PATH"
+ENV_KEYS = (ENV_OUTPUT_DIR, ENV_CLIENT_SECRETS, ENV_TOKEN_PATH)
+# Keys whose values are paths: relative values in an env file are resolved
+# against the env file's own directory (not the cwd), so the file behaves the
+# same from cron, launchd or an interactive shell.
+ENV_PATH_KEYS = frozenset(ENV_KEYS)
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_HOME_VAR_RE = re.compile(r"\$(?:HOME\b|\{HOME\})")
+
+
+class EnvFileError(ValueError):
+    """A malformed env file, or an explicitly requested one that is missing."""
+
+
+def _home(environ) -> str:
+    return (environ or {}).get("HOME") or os.path.expanduser("~")
+
+
+def expand_home(value: str, environ=None) -> str:
+    """Expand a leading ``~`` / ``~/`` and every ``$HOME`` / ``${HOME}``.
+
+    Deliberately only HOME: arbitrary ``$VAR`` interpolation would make the
+    file's meaning depend on whatever environment cron/launchd happens to give
+    it. ``~user`` is left alone.
+    """
+    home = _home(environ)
+    if value == "~" or value.startswith("~/"):
+        value = home + value[1:]
+    return _HOME_VAR_RE.sub(lambda _m: home, value)
+
+
+def parse_env_file(text: str, environ=None, source: str = ENV_FILENAME) -> Dict[str, str]:
+    """Parse ``KEY=VALUE`` lines (stdlib only; a small subset of dotenv).
+
+    * blank lines and lines starting with ``#`` are ignored; an optional
+      leading ``export `` is accepted so the file can also be ``source``d;
+    * unquoted values are stripped and a `` #`` (whitespace + hash) starts an
+      inline comment, so ``a#b`` keeps its hash;
+    * ``"double"`` quoted values get ``~``/``$HOME`` expansion, ``'single'``
+      quoted values are literal; text after the closing quote must be empty or
+      a comment;
+    * the last occurrence of a key wins.
+    Raises EnvFileError (with ``source:line``) on a malformed line.
+    """
+    out: Dict[str, str] = {}
+    for n, raw in enumerate(split_lines(text), 1):
+        line = raw.strip()
+        if n == 1:
+            line = line.lstrip("﻿")  # tolerate a UTF-8 BOM
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export ") or line.startswith("export\t"):
+            line = line[len("export"):].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not _ENV_KEY_RE.match(key):
+            raise EnvFileError(f"{source}:{n}: expected KEY=VALUE, got {raw!r}")
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            q = value[0]
+            end = value.find(q, 1)
+            rest = value[end + 1 :].strip() if end != -1 else ""
+            if end == -1 or (rest and not rest.startswith("#")):
+                raise EnvFileError(f"{source}:{n}: unterminated or malformed {q}quoted{q} value: {raw!r}")
+            value = value[1:end]
+            if q == '"':
+                value = expand_home(value, environ)
+        else:
+            value = re.split(r"\s#", value, maxsplit=1)[0].strip()
+            value = expand_home(value, environ)
+        out[key] = value
+    return out
+
+
+def config_dir(environ=None) -> str:
+    environ = environ if environ is not None else os.environ
+    base = environ.get("XDG_CONFIG_HOME") or os.path.join(_home(environ), ".config")
+    return os.path.join(base, "export-youtube-subscriptions")
+
+
+def default_script_dir() -> str:
+    """Directory of the executable, symlinks resolved (the module lives beside it)."""
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+def find_env_file(
+    cli_path: Optional[str], environ=None, script_dir: Optional[str] = None
+) -> Optional[str]:
+    """Locate the env file. Order: ``--env-file`` > ``$EYS_ENV_FILE`` >
+    ``<executable dir>/export-youtube-subscriptions.env`` >
+    ``~/.config/export-youtube-subscriptions/export-youtube-subscriptions.env``
+    (``$XDG_CONFIG_HOME`` honoured, same as the token default).
+
+    An explicitly named file (flag or env var) must exist: EnvFileError
+    otherwise, so a typo can't silently fall back to defaults. Implicit
+    locations are optional; None when nothing is found. An empty
+    ``EYS_ENV_FILE`` counts as unset.
+    """
+    environ = environ if environ is not None else os.environ
+    for explicit, label in ((cli_path, "--env-file"), (environ.get(ENV_FILE_VAR), f"${ENV_FILE_VAR}")):
+        if explicit:
+            path = os.path.abspath(expand_home(explicit, environ))
+            if not os.path.isfile(path):
+                raise EnvFileError(f"env file {path!r} (from {label}) not found")
+            return path
+    script_dir = script_dir if script_dir is not None else default_script_dir()
+    for cand in (os.path.join(script_dir, ENV_FILENAME), os.path.join(config_dir(environ), ENV_FILENAME)):
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+def load_env_file(path: Optional[str], environ=None) -> Dict[str, str]:
+    """Read + parse ``path`` (None -> {}); relative path values are anchored
+    to the env file's directory."""
+    if path is None:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise EnvFileError(f"cannot read env file {path!r}: {e}") from e
+    values = parse_env_file(text, environ, source=path)
+    base = os.path.dirname(path)
+    for key in ENV_PATH_KEYS:
+        v = values.get(key)
+        if v and not os.path.isabs(v):
+            values[key] = os.path.normpath(os.path.join(base, v))
+    return values
+
+
+def unknown_env_keys(values: Dict[str, str]) -> List[str]:
+    """Keys in the file this tool doesn't read (likely typos)."""
+    return sorted(k for k in values if k not in ENV_KEYS)
+
+
+@dataclass
+class Settings:
+    output_dir: str
+    client_secrets: str
+    token_path: str
+    env_file: Optional[str]
+    sources: Dict[str, str]  # setting name -> where its value came from
+    unknown_keys: List[str] = field(default_factory=list)  # env-file keys we don't read
+
+
+def resolve_settings(args, environ=None, script_dir: Optional[str] = None) -> Settings:
+    """Precedence per setting: CLI flag > process env var > env file > built-in default.
+
+    Empty values (``EYS_OUTPUT_DIR=``) count as unset at every layer.
+    """
+    environ = environ if environ is not None else os.environ
+    env_file = find_env_file(getattr(args, "env_file", None), environ, script_dir)
+    file_values = load_env_file(env_file, environ)
+
+    sources: Dict[str, str] = {}
+
+    def pick(name: str, flag_value: Optional[str], key: str, default: str) -> str:
+        # File values were already expanded/anchored by the parser (and a
+        # 'single-quoted' value must stay literal), so only the flag and the
+        # process env get ~/$HOME expansion here.
+        for value, src, expand in (
+            (flag_value, f"--{name}", True),
+            (environ.get(key), f"${key}", True),
+            (file_values.get(key), f"{key} in {env_file}", False),
+        ):
+            if value:
+                sources[name] = src
+                return expand_home(value, environ) if expand else value
+        sources[name] = "default"
+        return default
+
+    return Settings(
+        output_dir=pick("output-dir", args.output_dir, ENV_OUTPUT_DIR, "."),
+        client_secrets=pick("client-secrets", args.client_secrets, ENV_CLIENT_SECRETS, "client_secret.json"),
+        token_path=pick("token", args.token, ENV_TOKEN_PATH, default_token_path(environ)),
+        env_file=env_file,
+        sources=sources,
+        unknown_keys=unknown_env_keys(file_values),
+    )
+
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -548,17 +739,28 @@ def build_parser() -> argparse.ArgumentParser:
         prog="export-youtube-subscriptions",
         description="Export your YouTube subscriptions to musicians.md and youtubers.md.",
     )
-    p.add_argument("--output-dir", default=".", help="directory for the .md files (default: cwd)")
+    p.add_argument(
+        "--output-dir",
+        default=None,
+        help=f"directory for the .md files; created if missing (default: ${ENV_OUTPUT_DIR}, else cwd)",
+    )
     p.add_argument(
         "--client-secrets",
-        default="client_secret.json",
-        help="OAuth Desktop client JSON (default: client_secret.json)",
+        default=None,
+        help=f"OAuth Desktop client JSON (default: ${ENV_CLIENT_SECRETS}, else client_secret.json)",
     )
     p.add_argument(
         "--token",
         default=None,
-        help="cached OAuth token path (default: $XDG_CONFIG_HOME or ~/.config"
+        help=f"cached OAuth token path (default: ${ENV_TOKEN_PATH}, else $XDG_CONFIG_HOME or ~/.config"
         "/export-youtube-subscriptions/token.json)",
+    )
+    p.add_argument(
+        "--env-file",
+        metavar="PATH",
+        default=None,
+        help=f"env file with EYS_* settings (default: ${ENV_FILE_VAR}, else {ENV_FILENAME} next to the "
+        "executable, else ~/.config/export-youtube-subscriptions/; must exist when given explicitly)",
     )
     p.add_argument("--no-browser", action="store_true", help="print the auth URL instead of opening a browser")
     p.add_argument("--dry-run", action="store_true", help="print the summary without writing files")
@@ -577,15 +779,30 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[Sequence[str]] = None, fetch=None) -> int:
+def main(
+    argv: Optional[Sequence[str]] = None,
+    fetch=None,
+    environ=None,
+    script_dir: Optional[str] = None,
+) -> int:
+    """CLI entry. ``environ``/``script_dir`` are injectable so tests never read
+    the developer's real env file or environment."""
     args = build_parser().parse_args(argv)
     today = args.date or _dt.date.today().isoformat()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", today):
         print(f"error: --date must be YYYY-MM-DD, got {today!r}", file=sys.stderr)
         return 2
-    out_dir = args.output_dir
-    if not os.path.isdir(out_dir):
-        print(f"error: output dir {out_dir!r} does not exist", file=sys.stderr)
+    try:
+        settings = resolve_settings(args, environ, script_dir)
+    except EnvFileError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if settings.unknown_keys:
+        keys = ", ".join(settings.unknown_keys)
+        print(f"warning: {settings.env_file}: ignoring unknown key(s): {keys}", file=sys.stderr)
+    out_dir = settings.output_dir
+    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
+        print(f"error: output dir {out_dir!r} exists and is not a directory", file=sys.stderr)
         return 2
 
     try:
@@ -600,9 +817,7 @@ def main(argv: Optional[Sequence[str]] = None, fetch=None) -> int:
         elif args.from_json:
             channels = load_json_channels(args.from_json)
         else:
-            channels = fetch_from_api(
-                args.client_secrets, args.token or default_token_path(), not args.no_browser
-            )
+            channels = fetch_from_api(settings.client_secrets, settings.token_path, not args.no_browser)
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -617,7 +832,17 @@ def main(argv: Optional[Sequence[str]] = None, fetch=None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    created_dir = False
     if not args.dry_run:
+        # Created only after a successful fetch + merge, so an auth/API failure
+        # never leaves an empty directory behind.
+        if not os.path.isdir(out_dir):
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError as e:
+                print(f"error: cannot create output dir {out_dir!r}: {e}", file=sys.stderr)
+                return 2
+            created_dir = True
         for cat in CATEGORIES:
             lines = result.contents[cat]
             path = os.path.join(out_dir, FILENAMES[cat])
@@ -625,9 +850,18 @@ def main(argv: Optional[Sequence[str]] = None, fetch=None) -> int:
                 continue  # don't create empty files
             atomic_write(path, join_lines(lines))
 
+    print(f"env file: {settings.env_file or 'none'}")
+    note = ""
+    if created_dir:
+        note = ", created"
+    elif args.dry_run and not os.path.isdir(out_dir):
+        note = ", does not exist yet; would be created"
+    print(f"output dir: {os.path.abspath(out_dir)} (from {settings.sources['output-dir']}{note})")
     print(f"fetched {len(channels)} subscriptions")
     print(format_summary(result, args.dry_run))
     if args.verbose:
+        print(f"  client secrets: {settings.client_secrets} (from {settings.sources['client-secrets']})")
+        print(f"  token: {settings.token_path} (from {settings.sources['token']})")
         for cat in CATEGORIES:
             s = result.summary[cat]
             for label, ids in (
