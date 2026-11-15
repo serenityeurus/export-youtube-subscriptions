@@ -29,6 +29,11 @@ TODAY = "2026-11-15"
 LATER = "2026-12-01"
 
 
+def _read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def ch(cid, title, topic_ids=(), cats=()):
     return Channel(cid, title, list(topic_ids), list(cats))
 
@@ -722,6 +727,147 @@ class SettingsPrecedenceTests(unittest.TestCase):
         with open(os.path.join(self.d, eys.ENV_FILENAME), "w") as f:
             f.write("EYS_OUTPUT_DIR='/lit/~'\n")
         self.assertEqual(self.resolve().output_dir, "/lit/~")
+
+
+class Issue2EdgeCaseTests(unittest.TestCase):
+    """Gaps found reviewing the core against issue #2's acceptance criteria."""
+
+    # --- parser ---------------------------------------------------------
+    def test_bom_on_first_channel_line_is_recognised(self):
+        # A UTF-8 BOM (Windows editors) must not hide the first channel, or
+        # the next run would append a duplicate of it.
+        p = parse_line(f"\ufeff{URL}UCa # A")
+        self.assertIsNotNone(p)
+        self.assertEqual((p.id, p.name), ("UCa", "A"))
+        r = merge({YOUTUBER: [f"\ufeff{URL}UCa # A"]}, [ch("UCa", "A")], TODAY)
+        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # A"])
+        self.assertEqual(r.summary[YOUTUBER].added, [])
+
+    def test_scheme_and_host_case_insensitive(self):
+        p = parse_line("HTTPS://WWW.YouTube.com/channel/UCaBc # N")
+        self.assertIsNotNone(p)
+        self.assertEqual(p.id, "UCaBc")  # ids are case-sensitive: kept verbatim
+
+    def test_marker_on_hand_edited_variant(self):
+        p = parse_line("- http://m.youtube.com/channel/UCa/ Old [missing since 2026-01-02]")
+        self.assertEqual((p.id, p.name, p.missing_since), ("UCa", "Old", "2026-01-02"))
+
+    def test_empty_name_renders_without_dangling_separator(self):
+        self.assertEqual(format_line("UCa", ""), f"{URL}UCa")
+        self.assertEqual(format_line("UCa", "  ", TODAY), f"{URL}UCa [missing since {TODAY}]")
+        p = parse_line(format_line("UCa", "", TODAY))
+        self.assertEqual((p.id, p.name, p.missing_since), ("UCa", "", TODAY))
+
+    def test_other_lines_verbatim_including_whitespace(self):
+        odd = ["#  Musicians  ", "\t- note with tab", "   ", "https://www.youtube.com/@handle"]
+        r = merge({MUSICIAN: odd}, [ch("UCa", "A - Topic")], TODAY)
+        self.assertEqual(r.contents[MUSICIAN], odd + [f"{URL}UCa # A - Topic"])
+
+    # --- category callback ----------------------------------------------
+    def test_caller_supplied_category_callback(self):
+        calls = []
+
+        def cat(c):
+            calls.append(c.id)
+            return MUSICIAN if c.id.endswith("m") else YOUTUBER
+
+        existing = {YOUTUBER: [f"{URL}UCold # Old"]}
+        subs = [ch("UCold", "Old"), ch("UC1m", "x"), ch("UC2", "y"), ch("UC3m", "z")]
+        r = merge(existing, subs, TODAY, categorize=cat)
+        self.assertEqual(calls, ["UC1m", "UC2", "UC3m"])  # only new channels, input order
+        self.assertEqual(r.contents[MUSICIAN], ["# Musicians", "", f"{URL}UC1m # x", f"{URL}UC3m # z"])
+        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCold # Old", f"{URL}UC2 # y"])
+
+    def test_category_callback_bad_value_raises(self):
+        with self.assertRaises(ValueError):
+            merge({}, [ch("UCa", "A")], TODAY, categorize=lambda c: "podcast")
+
+    # --- duplicates -------------------------------------------------------
+    def test_duplicate_ids_all_lines_updated_and_counted_once(self):
+        existing = {
+            MUSICIAN: [f"{URL}UCa # Old", f"{URL}UCb # B"],
+            YOUTUBER: [f"{URL}UCa # Old", "- http://youtube.com/channel/UCb/ B"],
+        }
+        r = merge(existing, [ch("UCa", "New")], TODAY)
+        self.assertEqual(r.contents[MUSICIAN], [f"{URL}UCa # New", f"{URL}UCb # B [missing since {TODAY}]"])
+        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # New", f"{URL}UCb # B [missing since {TODAY}]"])
+        self.assertEqual(len(r.warnings), 2)
+        self.assertTrue(all("duplicate" in w for w in r.warnings))
+        # Stats belong to the first occurrence only, so totals and deltas agree.
+        m, y = r.summary[MUSICIAN], r.summary[YOUTUBER]
+        self.assertEqual((m.total, m.renamed, m.newly_missing), (2, ["UCa"], ["UCb"]))
+        self.assertEqual((y.total, y.renamed, y.newly_missing), (0, [], []))
+
+    def test_duplicate_within_one_file_warns(self):
+        r = merge({YOUTUBER: [f"{URL}UCa # A", f"{URL}UCa # A"]}, [ch("UCa", "A")], TODAY)
+        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # A", f"{URL}UCa # A"])
+        self.assertEqual(len(r.warnings), 1)
+        self.assertEqual(r.summary[YOUTUBER].total, 1)
+
+    # --- summary ---------------------------------------------------------
+    def test_summary_counts_all_kinds(self):
+        existing = {
+            YOUTUBER: [
+                f"{URL}UCkeep # Keep",
+                f"{URL}UCren # Before",
+                f"{URL}UCgone # Gone",
+                f"{URL}UCstill # Still [missing since 2026-01-01]",
+                f"{URL}UCback # Back [missing since 2026-01-01]",
+            ]
+        }
+        subs = [ch("UCkeep", "Keep"), ch("UCren", "After"), ch("UCback", "Back"), ch("UCnew", "New")]
+        s = merge(existing, subs, TODAY).summary[YOUTUBER]
+        self.assertEqual(s.total, 6)
+        self.assertEqual(s.added, ["UCnew"])
+        self.assertEqual(s.newly_missing, ["UCgone"])
+        self.assertEqual(s.still_missing, ["UCstill"])
+        self.assertEqual(s.restored, ["UCback"])
+        self.assertEqual(s.renamed, ["UCren"])
+        self.assertEqual(
+            s.counts(),
+            {"channels": 6, "added": 1, "newly_missing": 1, "still_missing": 1, "restored": 1, "renamed": 1},
+        )
+
+    # --- atomic write / idempotency on disk --------------------------------
+    def test_write_through_symlink_keeps_link(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real.md")
+            link = os.path.join(d, "youtubers.md")
+            with open(real, "w") as f:
+                f.write("old\n")
+            os.symlink(real, link)
+            self.assertTrue(eys.atomic_write(link, "new\n"))
+            self.assertTrue(os.path.islink(link))
+            self.assertEqual(eys.read_text(real), "new\n")
+            self.assertEqual(sorted(os.listdir(d)), ["real.md", "youtubers.md"])
+
+    def test_new_file_respects_umask(self):
+        old = os.umask(0o077)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                p = os.path.join(d, "f.md")
+                eys.atomic_write(p, "a\n")
+                self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+        finally:
+            os.umask(old)
+
+    def test_cli_rerun_byte_identical_and_mtime_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            subs = lambda: [ch("UCm", "A - Topic"), ch("UCy", "Vlog")]  # noqa: E731
+            with open(os.path.join(d, "youtubers.md"), "w") as f:
+                f.write(f"# Mine\n\n{URL}UCgone # Gone\n")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(eys.main(["--output-dir", d, "--date", TODAY], fetch=subs), 0)
+            paths = [os.path.join(d, n) for n in ("musicians.md", "youtubers.md")]
+            first = [_read_bytes(p) for p in paths]
+            for p in paths:
+                os.utime(p, (1, 1))
+            with redirect_stdout(out):
+                self.assertEqual(eys.main(["--output-dir", d, "--date", LATER], fetch=subs), 0)
+            self.assertEqual([_read_bytes(p) for p in paths], first)
+            self.assertEqual([os.stat(p).st_mtime for p in paths], [1, 1])
+            self.assertIn(f"[missing since {TODAY}]".encode(), first[1])
 
 
 if __name__ == "__main__":

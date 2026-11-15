@@ -19,7 +19,7 @@ import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
 
@@ -35,8 +35,12 @@ CHANNEL_URL_PREFIX = "https://www.youtube.com/channel/"
 # A channel line: URL, optional "# comment". Tolerates a list bullet,
 # http/no-www/m., a trailing slash and a missing "#" so hand-edited lines are
 # still recognised (and never duplicated); they are re-rendered canonically.
+# A leading UTF-8 BOM is tolerated (Windows editors) and scheme/host match
+# case-insensitively; the channel id itself is case-sensitive and kept verbatim.
+# Not recognised (treated as plain text, so the channel would be re-added):
+# Markdown links, @handle / /c/ URLs, and extra path segments like /videos.
 _CHANNEL_LINE_RE = re.compile(
-    r"^\s*(?:[-*+]\s+)?(?:https?://)?(?:www\.|m\.)?youtube\.com/channel/"
+    r"^\ufeff?\s*(?:[-*+]\s+)?(?:(?i:https?)://)?(?:(?i:www|m)\.)?(?i:youtube\.com/channel)/"
     r"(?P<id>[A-Za-z0-9_-]+)/?(?:(?:\s*#|\s)\s?(?P<comment>.*?))?\s*$"
 )
 _MISSING_RE = re.compile(r"\s*\[missing since (?P<date>\d{4}-\d{2}-\d{2})\]\s*$")
@@ -76,6 +80,16 @@ class FileSummary:
     renamed: List[str] = field(default_factory=list)
     total: int = 0
 
+    def counts(self) -> Dict[str, int]:
+        return {
+            "channels": self.total,
+            "added": len(self.added),
+            "newly_missing": len(self.newly_missing),
+            "still_missing": len(self.still_missing),
+            "restored": len(self.restored),
+            "renamed": len(self.renamed),
+        }
+
 
 @dataclass
 class MergeResult:
@@ -113,7 +127,9 @@ def parse_line(line: str) -> Optional[ParsedLine]:
 
 
 def format_line(channel_id: str, name: str, missing_since: Optional[str] = None) -> str:
-    line = f"{CHANNEL_URL_PREFIX}{channel_id} # {clean_name(name)}"
+    name = clean_name(name)
+    # No name -> bare URL, so we never emit "URL # " / "URL #  [missing ...]".
+    line = f"{CHANNEL_URL_PREFIX}{channel_id}" + (f" # {name}" if name else "")
     if missing_since:
         line += f" [missing since {missing_since}]"
     return line
@@ -245,6 +261,9 @@ def categorize(channel: Channel, overrides: Dict[str, str]) -> str:
     return overrides.get(channel.id) or classify(channel)
 
 
+_default_categorize = categorize  # merge()'s ``categorize`` parameter shadows the name
+
+
 # --------------------------------------------------------------------------
 # Merge
 # --------------------------------------------------------------------------
@@ -260,6 +279,7 @@ def merge(
     today: str,
     overrides: Optional[Dict[str, str]] = None,
     allow_empty: bool = False,
+    categorize: Optional[Callable[[Channel], str]] = None,
 ) -> MergeResult:
     """Merge the current subscription list into the existing file contents.
 
@@ -274,8 +294,15 @@ def merge(
       * New channels are appended to the end of their category's file,
         in subscription-list order.
       * Output for an unchanged input is byte-identical (idempotent).
+      * ``categorize(channel) -> MUSICIAN|YOUTUBER`` picks the file for *new*
+        channels only (default: overrides, then the heuristic). It is never
+        consulted for channels already in a file.
+      * A channel id on several lines (hand edits): every line is updated and
+        a warning emitted; summary stats count only the first occurrence.
     """
     overrides = overrides or {}
+    if categorize is None:
+        categorize = lambda c: _default_categorize(c, overrides)  # noqa: E731
     if not channels and not allow_empty:
         n = count_channels(existing)
         if n:
@@ -301,21 +328,25 @@ def merge(
             if p is None:
                 out.append(line)
                 continue
-            if p.id in seen:
+            first = p.id not in seen
+            if first:
+                seen[p.id] = cat
+                s.total += 1
+            else:
                 warnings.append(
                     f"duplicate channel {p.id} in {FILENAMES[cat]} "
                     f"(also in {FILENAMES[seen[p.id]]}); left in place"
                 )
-            else:
-                seen[p.id] = cat
-                s.total += 1
+            # Duplicates are still rewritten, but stats come from the first line
+            # only so per-file totals and deltas stay consistent.
+            stats = s if first else FileSummary()
             ch = current.get(p.id)
             if ch is not None:
                 name = clean_name(ch.title) or p.name
                 if p.missing_since:
-                    s.restored.append(p.id)
+                    stats.restored.append(p.id)
                 if p.name and name != p.name:
-                    s.renamed.append(p.id)
+                    stats.renamed.append(p.id)
                 out.append(format_line(p.id, name))
                 want = overrides.get(p.id)
                 if want and want != cat:
@@ -325,14 +356,16 @@ def merge(
                     )
             else:
                 since = p.missing_since or today
-                (s.still_missing if p.missing_since else s.newly_missing).append(p.id)
+                (stats.still_missing if p.missing_since else stats.newly_missing).append(p.id)
                 out.append(format_line(p.id, p.name, since))
         contents[cat] = out
 
     for ch in current.values():
         if ch.id in seen:
             continue
-        cat = categorize(ch, overrides)
+        cat = categorize(ch)
+        if cat not in CATEGORIES:
+            raise ValueError(f"categorize({ch.id!r}) returned {cat!r}; expected one of {CATEGORIES}")
         lines = contents[cat]
         if not lines:
             lines.extend([HEADERS[cat], ""])  # brand-new file gets a header
@@ -368,15 +401,20 @@ def atomic_write(path: str, text: str) -> bool:
 
     Temp file in the same directory + fsync + os.replace, so a crash leaves
     either the old or the new file, never a truncated one. Existing file
-    permissions are preserved.
+    permissions are preserved; owner/group and extended attributes are not.
     """
+    # Write to the symlink target so a linked file (e.g. into a notes repo or
+    # dotfiles) stays a link instead of being replaced by a regular file.
+    path = os.path.realpath(path)
     if os.path.exists(path) and read_text(path) == text:
         return False
-    directory = os.path.dirname(os.path.abspath(path))
+    directory = os.path.dirname(path)
     try:
         mode = os.stat(path).st_mode & 0o777
     except FileNotFoundError:
-        mode = 0o644
+        umask = os.umask(0)  # mkstemp is 0600; new files get the usual 0666 & ~umask
+        os.umask(umask)
+        mode = 0o666 & ~umask
     fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
@@ -385,6 +423,7 @@ def atomic_write(path: str, text: str) -> bool:
             os.fsync(f.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, path)
+        _fsync_dir(directory)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -392,6 +431,20 @@ def atomic_write(path: str, text: str) -> bool:
             pass
         raise
     return True
+
+
+def _fsync_dir(directory: str) -> None:
+    """Best effort: persist the rename itself (POSIX); a no-op where unsupported."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def load_existing(output_dir: str) -> Dict[str, List[str]]:
