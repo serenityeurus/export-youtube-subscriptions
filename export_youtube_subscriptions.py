@@ -20,6 +20,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from urllib.parse import unquote
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
 
@@ -201,7 +202,22 @@ WEAK_WIKI_SLUGS = frozenset({"entertainment", "performing_arts"})
 
 
 def _wiki_slug(url: str) -> str:
-    return url.rstrip("/").rsplit("/", 1)[-1].lower()
+    """Article slug of a Wikipedia URL, normalised for lookup.
+
+    The API sends ``https://en.wikipedia.org/wiki/Hip_hop_music``. Hand-written
+    ``--from-json`` fixtures drift from that, so a query/fragment, a trailing
+    slash, percent-encoding, spaces for underscores and letter case are all
+    normalised away. The fragment is dropped first: ``Humour#Music`` is the
+    Humour article.
+    """
+    path = re.split(r"[?#]", url.strip(), maxsplit=1)[0]
+    slug = unquote(path.rstrip("/").rsplit("/", 1)[-1])
+    return _WS_RE.sub("_", slug.strip()).lower()
+
+
+def _usable(values: Optional[Iterable[object]]) -> List[str]:
+    """Non-blank strings from an API/fixture list that may be None or hold junk."""
+    return [v.strip() for v in values or () if isinstance(v, str) and v.strip()]
 
 
 def classify(channel: Channel) -> str:
@@ -215,6 +231,12 @@ def classify(channel: Channel) -> str:
          (gaming, technology, film, humor, lifestyle, ...) means the channel
          is about something else and merely features music -> youtuber.
     Otherwise youtuber (including channels with no topics at all).
+
+    Topics from ``topic_ids`` (Freebase) and ``topic_categories`` (Wikipedia
+    URLs) are pooled: music may come from either list and one strong topic in
+    either list disqualifies. Blank or non-string entries are skipped rather
+    than counted as strong, so a sloppy payload can't demote a musician.
+    Freebase ids are compared case-sensitively, as the API defines them.
     """
     title = (channel.title or "").strip()
     if title.endswith(" - Topic"):
@@ -223,13 +245,12 @@ def classify(channel: Channel) -> str:
         return MUSICIAN
 
     music = strong_other = False
-    for tid in channel.topic_ids or ():
-        if tid in MUSIC_TOPIC_IDS:
+    for topic_id in _usable(channel.topic_ids):
+        if topic_id in MUSIC_TOPIC_IDS:
             music = True
-        elif tid not in WEAK_TOPIC_IDS:
+        elif topic_id not in WEAK_TOPIC_IDS:
             strong_other = True
-    for url in channel.topic_categories or ():
-        slug = _wiki_slug(url)
+    for slug in map(_wiki_slug, _usable(channel.topic_categories)):
         if slug in MUSIC_WIKI_SLUGS:
             music = True
         elif slug not in WEAK_WIKI_SLUGS:
@@ -237,31 +258,55 @@ def classify(channel: Channel) -> str:
     return MUSICIAN if music and not strong_other else YOUTUBER
 
 
-def parse_overrides(text: str) -> Dict[str, str]:
-    """Parse overrides.txt: ``UCxxx musician|youtuber  # optional comment``.
+class OverridesError(ValueError):
+    """A malformed or unreadable overrides.txt: a config error (exit code 2)."""
 
-    Blank lines and ``#`` comment lines are ignored. Raises ValueError on a
-    malformed line so typos are surfaced instead of silently ignored.
+
+_CHANNEL_ID_RE = re.compile(r"[A-Za-z0-9_-]+")  # same alphabet as _CHANNEL_LINE_RE
+
+
+def parse_overrides(text: str, source: str = OVERRIDES_FILENAME) -> Dict[str, str]:
+    """Parse overrides.txt: ``CHANNEL_ID musician|youtuber  # optional comment``.
+
+    Blank lines and ``#`` comments are ignored, the category is matched
+    case-insensitively and a leading UTF-8 BOM is tolerated. Raises
+    OverridesError with ``source:line`` on anything else, so a typo stops the
+    run instead of being silently ignored:
+      * a line that isn't exactly two fields, or an unknown category;
+      * a channel id with characters YouTube ids can't contain (a pasted URL,
+        ``UCa:``): it could never match a channel, so it would be a no-op;
+      * the same id given both categories (repeating the same one is fine).
     """
-    out: Dict[str, str] = {}
-    for n, raw in enumerate(split_lines(text), 1):
-        line = raw.split("#", 1)[0].strip()
-        if not line:
+    overrides: Dict[str, str] = {}
+    first_line: Dict[str, int] = {}
+    for lineno, raw in enumerate(split_lines(text), 1):
+        line = raw.lstrip("\ufeff") if lineno == 1 else raw
+        fields = line.split("#", 1)[0].split()
+        if not fields:
             continue
-        parts = line.split()
-        if len(parts) != 2 or parts[1].lower() not in CATEGORIES:
-            raise ValueError(
-                f"{OVERRIDES_FILENAME}:{n}: expected 'CHANNEL_ID musician|youtuber', got {raw!r}"
+        where = f"{source}:{lineno}"
+        category = fields[1].lower() if len(fields) == 2 else ""
+        if category not in CATEGORIES or not _CHANNEL_ID_RE.fullmatch(fields[0]):
+            raise OverridesError(f"{where}: expected 'CHANNEL_ID musician|youtuber', got {raw!r}")
+        channel_id = fields[0]
+        if overrides.setdefault(channel_id, category) != category:
+            raise OverridesError(
+                f"{where}: {channel_id} is already a {overrides[channel_id]} on line "
+                f"{first_line[channel_id]}; keep one of the two lines"
             )
-        out[parts[0]] = parts[1].lower()
-    return out
+        first_line.setdefault(channel_id, lineno)
+    return overrides
 
 
 def categorize(channel: Channel, overrides: Dict[str, str]) -> str:
+    """Category for a *new* channel: a manual override wins over the heuristic."""
     return overrides.get(channel.id) or classify(channel)
 
 
-_default_categorize = categorize  # merge()'s ``categorize`` parameter shadows the name
+def make_categorizer(overrides: Optional[Dict[str, str]] = None) -> Callable[[Channel], str]:
+    """The ``categorize`` callback merge() consults when placing a new channel."""
+    table = dict(overrides or {})
+    return lambda channel: categorize(channel, table)
 
 
 # --------------------------------------------------------------------------
@@ -295,14 +340,17 @@ def merge(
         in subscription-list order.
       * Output for an unchanged input is byte-identical (idempotent).
       * ``categorize(channel) -> MUSICIAN|YOUTUBER`` picks the file for *new*
-        channels only (default: overrides, then the heuristic). It is never
-        consulted for channels already in a file.
+        channels only (default: ``make_categorizer(overrides)``, i.e. overrides,
+        then the heuristic). It is never consulted for channels already in a
+        file.
+      * An override that disagrees with the file a channel is already in only
+        produces a warning (subscribed or missing alike); the line stays put.
       * A channel id on several lines (hand edits): every line is updated and
         a warning emitted; summary stats count only the first occurrence.
     """
     overrides = overrides or {}
     if categorize is None:
-        categorize = lambda c: _default_categorize(c, overrides)  # noqa: E731
+        categorize = make_categorizer(overrides)
     if not channels and not allow_empty:
         n = count_channels(existing)
         if n:
@@ -348,16 +396,19 @@ def merge(
                 if p.name and name != p.name:
                     stats.renamed.append(p.id)
                 out.append(format_line(p.id, name))
-                want = overrides.get(p.id)
-                if want and want != cat:
-                    warnings.append(
-                        f"override says {p.id} is a {want} but it is listed in "
-                        f"{FILENAMES[cat]}; existing lines are never moved, move it by hand"
-                    )
             else:
                 since = p.missing_since or today
                 (stats.still_missing if p.missing_since else stats.newly_missing).append(p.id)
                 out.append(format_line(p.id, p.name, since))
+            # Positions are fixed, so an override can't move a line that already
+            # exists; tell the user where to paste it instead. Checked for
+            # missing channels too: the placement is wrong either way.
+            want = overrides.get(p.id)
+            if want and want != cat:
+                warnings.append(
+                    f"override says {p.id} is a {want} but it is listed in {FILENAMES[cat]}; "
+                    f"existing lines are never moved, move it by hand into {FILENAMES[want]}"
+                )
         contents[cat] = out
 
     for ch in current.values():
@@ -452,7 +503,17 @@ def load_existing(output_dir: str) -> Dict[str, List[str]]:
 
 
 def load_overrides(output_dir: str) -> Dict[str, str]:
-    return parse_overrides(read_text(os.path.join(output_dir, OVERRIDES_FILENAME)))
+    """Read ``<output_dir>/overrides.txt``; a missing file means no overrides.
+
+    Anything else that stops it being read (a directory, permissions, bytes
+    that aren't UTF-8) is an OverridesError, not a traceback.
+    """
+    path = os.path.join(output_dir, OVERRIDES_FILENAME)
+    try:
+        text = read_text(path)
+    except (OSError, UnicodeDecodeError) as e:
+        raise OverridesError(f"cannot read {path}: {e}") from e
+    return parse_overrides(text, source=path)
 
 
 # --------------------------------------------------------------------------
@@ -518,8 +579,8 @@ def load_json_channels(path: str) -> List[Channel]:
         Channel(
             id=d["id"],
             title=clean_name(d.get("title", "")),
-            topic_ids=list(d.get("topicIds", [])),
-            topic_categories=list(d.get("topicCategories", [])),
+            topic_ids=list(d.get("topicIds") or []),  # tolerate an explicit null
+            topic_categories=list(d.get("topicCategories") or []),
         )
         for d in data
     ]
@@ -858,9 +919,9 @@ def main(
         print(f"error: output dir {out_dir!r} exists and is not a directory", file=sys.stderr)
         return 2
 
-    try:
+    try:  # before the fetch: a config typo shouldn't cost API quota
         overrides = load_overrides(out_dir)
-    except ValueError as e:
+    except OverridesError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
@@ -880,7 +941,14 @@ def main(
 
     existing = load_existing(out_dir)
     try:
-        result = merge(existing, channels, today, overrides, allow_empty=args.allow_empty)
+        result = merge(
+            existing,
+            channels,
+            today,
+            overrides,
+            allow_empty=args.allow_empty,
+            categorize=make_categorizer(overrides),
+        )
     except EmptySubscriptionsError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

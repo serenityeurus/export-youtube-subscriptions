@@ -870,5 +870,344 @@ class Issue2EdgeCaseTests(unittest.TestCase):
             self.assertIn(f"[missing since {TODAY}]".encode(), first[1])
 
 
+# --------------------------------------------------------------------------
+# Issue #3: classification heuristics and overrides.txt
+# --------------------------------------------------------------------------
+
+WIKI = "https://en.wikipedia.org/wiki/"
+# Freebase id -> Wikipedia slug, exactly the lists in README "Classification".
+MUSIC_TOPICS = {
+    "/m/04rlf": "Music",
+    "/m/064t9": "Pop_music",
+    "/m/06by7": "Rock_music",
+    "/m/0glt670": "Hip_hop_music",
+    "/m/02lkt": "Electronic_music",
+    "/m/03_d0": "Jazz",
+    "/m/0ggq0m": "Classical_music",
+    "/m/01lyv": "Country_music",
+    "/m/06j6l": "Rhythm_and_blues",
+    "/m/0gywn": "Soul_music",
+    "/m/06cqb": "Reggae",
+    "/m/05rwpb": "Independent_music",
+    "/m/02mscn": "Christian_music",
+    "/m/028sqc": "Music_of_Asia",
+    "/m/0g293": "Music_of_Latin_America",
+}
+WEAK_TOPICS = {"/m/02jjt": "Entertainment", "/m/05qjc": "Performing_arts"}
+GAMING, TECH = "/m/0bzvm2", "/m/07c1v"  # strong: anything not listed above
+
+
+class Issue3ClassifyTableTests(unittest.TestCase):
+    def check(self, cases):
+        for title, topic_ids, cats, want in cases:
+            with self.subTest(title=title, topic_ids=topic_ids, cats=cats):
+                self.assertEqual(classify(ch("UCx", title, topic_ids, cats)), want)
+
+    def test_readme_topic_lists_are_exact(self):
+        self.assertEqual(eys.MUSIC_TOPIC_IDS, frozenset(MUSIC_TOPICS))
+        self.assertEqual(eys.WEAK_TOPIC_IDS, frozenset(WEAK_TOPICS))
+        self.assertEqual(eys.MUSIC_WIKI_SLUGS, frozenset(s.lower() for s in MUSIC_TOPICS.values()))
+        self.assertEqual(eys.WEAK_WIKI_SLUGS, frozenset(s.lower() for s in WEAK_TOPICS.values()))
+
+    def test_rule1_topic_suffix(self):
+        self.check(
+            [
+                ("Daft Punk - Topic", [], [], MUSICIAN),
+                ("Daft Punk - Topic", [GAMING], [], MUSICIAN),  # title rule beats strong topics
+                ("Daft Punk - Topic  ", [], [], MUSICIAN),  # API whitespace noise
+                (" - Topic", [], [], YOUTUBER),  # stripped title is "- Topic": no artist name
+                ("Daft Punk - topic", [], [], YOUTUBER),  # suffix is exact, as YouTube writes it
+                ("Daft Punk -Topic", [], [], YOUTUBER),
+                ("Daft Punk - Topics", [], [], YOUTUBER),
+                ("Hot - Topic of the day", [], [], YOUTUBER),
+                ("Topic", [], [], YOUTUBER),
+            ]
+        )
+
+    def test_rule2_vevo_any_case_anywhere(self):
+        self.check(
+            [
+                ("TaylorSwiftVEVO", [], [], MUSICIAN),
+                ("taylorswiftvevo", [], [], MUSICIAN),
+                ("Vevo", [], [], MUSICIAN),
+                ("vEvO dscvr", [GAMING], [], MUSICIAN),  # title rule beats strong topics
+                ("VEV0 fan", [], [], YOUTUBER),
+                ("V E V O", [], [], YOUTUBER),
+            ]
+        )
+
+    def test_rule3_every_music_topic_alone(self):
+        for topic_id, slug in MUSIC_TOPICS.items():
+            with self.subTest(topic=topic_id):
+                self.assertEqual(classify(ch("UCx", "Band", [topic_id])), MUSICIAN)
+                self.assertEqual(classify(ch("UCx", "Band", cats=[WIKI + slug])), MUSICIAN)
+
+    def test_rule3_weak_and_strong_mixes(self):
+        weak = list(WEAK_TOPICS)
+        self.check(
+            [
+                ("Band", ["/m/04rlf"] + weak, [], MUSICIAN),
+                ("Band", ["/m/04rlf", "/m/06by7"] + weak, [], MUSICIAN),
+                ("Band", weak, [], YOUTUBER),  # weak alone is not music
+                ("Band", [weak[0]], [], YOUTUBER),
+                ("Band", [GAMING], [], YOUTUBER),
+                ("Band", ["/m/04rlf", GAMING], [], YOUTUBER),
+                ("Band", ["/m/04rlf", TECH] + weak, [], YOUTUBER),
+                ("Band", [GAMING, "/m/04rlf"], [], YOUTUBER),  # order doesn't matter
+                ("Band", ["/m/04rlf", "/m/04rlf"], [], MUSICIAN),  # repeats are harmless
+                ("Band", [], [], YOUTUBER),  # no topics at all
+                ("", [], [], YOUTUBER),
+            ]
+        )
+
+    def test_rule3_sources_are_combined(self):
+        self.check(
+            [
+                ("Band", ["/m/04rlf"], [WIKI + "Music", WIKI + "Entertainment"], MUSICIAN),
+                ("Band", [], [WIKI + "Music", WIKI + "Performing_arts"], MUSICIAN),
+                ("Band", ["/m/02jjt"], [WIKI + "Jazz"], MUSICIAN),  # music only in categories
+                ("Band", ["/m/03_d0"], [WIKI + "Entertainment"], MUSICIAN),  # music only in ids
+                ("Band", ["/m/04rlf"], [WIKI + "Video_game_culture"], YOUTUBER),  # strong in categories
+                ("Band", [GAMING], [WIKI + "Music"], YOUTUBER),  # strong in ids
+                ("Band", [], [WIKI + "Entertainment"], YOUTUBER),
+                ("Band", [], [WIKI + "Musical_theatre"], YOUTUBER),  # not in the list: strong
+                ("Band", [], [WIKI + "Music_of_Africa"], YOUTUBER),
+            ]
+        )
+
+    def test_wikipedia_url_variants(self):
+        self.check(
+            [
+                ("Band", [], ["https://en.wikipedia.org/wiki/Music"], MUSICIAN),
+                ("Band", [], ["http://en.m.wikipedia.org/wiki/music/"], MUSICIAN),
+                ("Band", [], [WIKI + "Rhythm%20and%20blues"], MUSICIAN),  # percent-encoded
+                ("Band", [], [WIKI + "Hip hop music"], MUSICIAN),  # spaces for underscores
+                ("Band", [], [WIKI + "Music?oldid=1#History"], MUSICIAN),  # query + fragment
+                ("Band", [], [" " + WIKI + "Music\n"], MUSICIAN),
+                ("Band", [], [WIKI + "Music#Entertainment"], MUSICIAN),
+                ("Band", [], [WIKI + "Humour#Music"], YOUTUBER),  # fragment is not the article
+            ]
+        )
+
+    def test_blank_and_missing_topics_are_ignored(self):
+        self.check(
+            [
+                ("Band", ["/m/04rlf", "", "  "], ["", None], MUSICIAN),  # blanks don't count as strong
+                ("Band", [" /m/04rlf "], [], MUSICIAN),
+                ("Band", ["", None], [""], YOUTUBER),  # nothing usable -> no topics
+                ("Band", ["/M/04RLF"], [], YOUTUBER),  # Freebase ids are case-sensitive: unknown -> strong
+            ]
+        )
+        self.assertEqual(classify(Channel("UCx", None, None, None)), YOUTUBER)
+        self.assertEqual(classify(Channel("UCx", "Band", None, [WIKI + "Jazz"])), MUSICIAN)
+
+
+class Issue3OverridesParseTests(unittest.TestCase):
+    def test_valid_forms(self):
+        cases = [
+            ("", {}),
+            ("\n\n   \n", {}),
+            ("# only a comment\n", {}),
+            ("UCa musician\n", {"UCa": MUSICIAN}),
+            ("UCa youtuber", {"UCa": YOUTUBER}),  # no trailing newline
+            ("UCa\tmusician\t# tab separated\n", {"UCa": MUSICIAN}),
+            ("  UCa   youtuber   # padded\n", {"UCa": YOUTUBER}),
+            ("UCa musician#tight comment\n", {"UCa": MUSICIAN}),
+            ("UCa Musician\nUCb YOUTUBER\n", {"UCa": MUSICIAN, "UCb": YOUTUBER}),
+            ("UCa musician\r\nUCb youtuber\r\n", {"UCa": MUSICIAN, "UCb": YOUTUBER}),  # CRLF
+            ("﻿UCa musician\n", {"UCa": MUSICIAN}),  # BOM from a Windows editor
+            ("﻿# header\nUC-a_1 youtuber\n", {"UC-a_1": YOUTUBER}),
+            ("UCa musician\nUCa musician # same again\n", {"UCa": MUSICIAN}),  # harmless repeat
+            ("UCa musician\nUca youtuber\n", {"UCa": MUSICIAN, "Uca": YOUTUBER}),  # ids are case-sensitive
+        ]
+        for text, want in cases:
+            with self.subTest(text=text):
+                self.assertEqual(parse_overrides(text), want)
+
+    def test_readme_example(self):
+        text = (
+            "# CHANNEL_ID category  # optional comment\n"
+            "UCxxxxxxxxxxxxxxxxxxxxxx musician   # band without topic tags\n"
+            "UCyyyyyyyyyyyyyyyyyyyyyy youtuber   # music-theory teacher\n"
+        )
+        self.assertEqual(
+            parse_overrides(text),
+            {"UCxxxxxxxxxxxxxxxxxxxxxx": MUSICIAN, "UCyyyyyyyyyyyyyyyyyyyyyy": YOUTUBER},
+        )
+
+    def test_malformed_lines_raise_config_error_with_location(self):
+        cases = [
+            ("UCa\n", 1),  # no category
+            ("UCa singer\n", 1),  # unknown category
+            ("UCa musicians\n", 1),  # plural typo
+            ("UCa musician extra\n", 1),  # trailing junk
+            ("UCa = musician\n", 1),
+            ("UCa: musician\n", 1),
+            ("musician UCa\n", 1),  # swapped columns
+            ("# ok\n\nUCa musician\nUCb\n", 4),  # line number counts blanks/comments
+            (URL + "UCa musician\n", 1),  # a URL is not an id
+            ("UC$a musician\n", 1),
+            ("UCa musician\nUCb youtuber\nUCa youtuber\n", 3),  # contradicts line 1
+        ]
+        for text, lineno in cases:
+            with self.subTest(text=text):
+                with self.assertRaises(eys.OverridesError) as ctx:
+                    parse_overrides(text)
+                self.assertIn(f"overrides.txt:{lineno}:", str(ctx.exception))
+        self.assertTrue(issubclass(eys.OverridesError, ValueError))
+
+    def test_error_names_the_source_path(self):
+        with self.assertRaises(eys.OverridesError) as ctx:
+            parse_overrides("UCa nope\n", source="/notes/overrides.txt")
+        self.assertIn("/notes/overrides.txt:1:", str(ctx.exception))
+
+    def test_load_overrides(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(eys.load_overrides(d), {})  # no file is fine
+            path = os.path.join(d, "overrides.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("UCa musician  # café band\n")
+            self.assertEqual(eys.load_overrides(d), {"UCa": MUSICIAN})
+            with open(path, "wb") as f:
+                f.write(b"UCa musician # \xff\xfe\n")  # not UTF-8
+            with self.assertRaises(eys.OverridesError):
+                eys.load_overrides(d)
+            os.remove(path)
+            os.mkdir(path)  # unreadable: a directory
+            with self.assertRaises(eys.OverridesError) as ctx:
+                eys.load_overrides(d)
+            self.assertIn(path, str(ctx.exception))
+
+
+class Issue3OverridesMergeTests(unittest.TestCase):
+    def test_new_channel_placement_table(self):
+        cases = [
+            # title, topic ids, override, expected file
+            ("X - Topic", [], None, MUSICIAN),
+            ("X - Topic", [], YOUTUBER, YOUTUBER),
+            ("XVEVO", [], YOUTUBER, YOUTUBER),
+            ("Theory teacher", ["/m/04rlf"], YOUTUBER, YOUTUBER),  # README weak spot
+            ("Untagged band", [], None, YOUTUBER),
+            ("Untagged band", [], MUSICIAN, MUSICIAN),
+            ("Gamer", [GAMING], MUSICIAN, MUSICIAN),
+            ("Band", ["/m/04rlf"], MUSICIAN, MUSICIAN),  # agreeing override
+        ]
+        for title, topic_ids, override, want in cases:
+            with self.subTest(title=title, override=override):
+                overrides = {"UCa": override} if override else {}
+                r = merge({}, [ch("UCa", title, topic_ids)], TODAY, overrides)
+                other = YOUTUBER if want == MUSICIAN else MUSICIAN
+                self.assertEqual(r.contents[want][-1], f"{URL}UCa # {title}")
+                self.assertEqual(r.contents[other], [])
+                self.assertEqual(r.summary[want].added, ["UCa"])
+                self.assertEqual(r.warnings, [])
+
+    def test_categorizer_is_the_merge_callback(self):
+        categorize = eys.make_categorizer({"UCo": YOUTUBER})
+        self.assertEqual(categorize(ch("UCo", "X - Topic")), YOUTUBER)
+        self.assertEqual(categorize(ch("UCn", "X - Topic")), MUSICIAN)
+        self.assertEqual(categorize(ch("UCn", "Vlog")), YOUTUBER)
+        r = merge({}, [ch("UCo", "X - Topic"), ch("UCn", "Y - Topic")], TODAY, categorize=categorize)
+        self.assertEqual(r.contents[YOUTUBER], ["# YouTubers", "", f"{URL}UCo # X - Topic"])
+        self.assertEqual(r.contents[MUSICIAN], ["# Musicians", "", f"{URL}UCn # Y - Topic"])
+
+    def test_disagreement_warns_and_never_moves(self):
+        cases = [
+            # file holding the line, override, subscribed?, missing marker already there?
+            (YOUTUBER, MUSICIAN, True, False),
+            (MUSICIAN, YOUTUBER, True, False),
+            (YOUTUBER, MUSICIAN, False, False),  # unsubscribed: still misplaced per the override
+            (MUSICIAN, YOUTUBER, False, True),
+            (MUSICIAN, YOUTUBER, True, True),  # restored in place
+        ]
+        for cat, override, subscribed, marked in cases:
+            with self.subTest(cat=cat, subscribed=subscribed, marked=marked):
+                other = YOUTUBER if cat == MUSICIAN else MUSICIAN
+                line = format_line("UCa", "Band", "2026-01-01" if marked else None)
+                existing = {cat: ["# Mine", line], other: ["# Other"]}
+                subs = [ch("UCa", "Band"), ch("UCkeep", "Keep")] if subscribed else [ch("UCkeep", "Keep")]
+                r = merge(existing, subs, TODAY, {"UCa": override})
+                self.assertEqual(len(r.contents[cat]), 2 + (cat == YOUTUBER))
+                self.assertTrue(r.contents[cat][1].startswith(f"{URL}UCa # Band"))
+                self.assertFalse(any("UCa" in out_line for out_line in r.contents[other]))
+                hits = [w for w in r.warnings if "UCa" in w]
+                self.assertEqual(len(hits), 1, r.warnings)
+                for needle in (override, eys.FILENAMES[cat], eys.FILENAMES[other], "by hand"):
+                    self.assertIn(needle, hits[0])
+
+    def test_agreeing_or_unrelated_override_is_silent(self):
+        existing = {MUSICIAN: [f"{URL}UCa # Band"], YOUTUBER: [f"{URL}UCb # Vlog"]}
+        subs = [ch("UCa", "Band"), ch("UCb", "Vlog")]
+        r = merge(existing, subs, TODAY, {"UCa": MUSICIAN, "UCb": YOUTUBER, "UCnowhere": MUSICIAN})
+        self.assertEqual(r.warnings, [])
+        self.assertEqual(r.contents, existing)
+
+    def test_override_set_after_placement_is_stable_across_runs(self):
+        subs = [ch("UCa", "Teacher", ["/m/04rlf"])]
+        first = merge({}, subs, TODAY)  # heuristic: musician
+        second = merge(first.contents, subs, LATER, {"UCa": YOUTUBER})
+        self.assertEqual(second.contents, first.contents)
+        self.assertEqual(len(second.warnings), 1)
+        third = merge(second.contents, subs, LATER, {"UCa": YOUTUBER})
+        self.assertEqual(third.contents, first.contents)
+
+
+class Issue3CliTests(unittest.TestCase):
+    # Borrow the sandboxed runner without inheriting (and re-running) CliTests.
+    setUp, tearDown, run_cli = CliTests.setUp, CliTests.tearDown, CliTests.run_cli
+
+    def write(self, directory, name, text):
+        with open(os.path.join(directory, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_overrides_place_new_channels_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, "youtubers.md", f"# YouTubers\n\n{URL}UCold # Old - Topic\n")
+            fixture = os.path.join(d, "subs.json")
+            with open(fixture, "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {"id": "UCband", "title": "Band"},
+                        {"id": "UCteach", "title": "Teacher", "topicIds": ["/m/04rlf"], "topicCategories": None},
+                        {"id": "UCold", "title": "Old - Topic", "topicIds": None},
+                        {"id": "UCjazz", "title": "Trio", "topicCategories": [WIKI + "Jazz", WIKI + "Entertainment"]},
+                    ],
+                    f,
+                )
+            self.write(d, "overrides.txt", "# mine\nUCband musician  # untagged\nUCteach youtuber\nUCold musician\n")
+            code, out, err = self.run_cli("--output-dir", d, "--from-json", fixture, "--date", TODAY)
+            self.assertEqual((code, err), (0, ""))
+            musicians = _read_bytes(os.path.join(d, "musicians.md")).decode()
+            youtubers = _read_bytes(os.path.join(d, "youtubers.md")).decode()
+            self.assertEqual(musicians, f"# Musicians\n\n{URL}UCband # Band\n{URL}UCjazz # Trio\n")
+            self.assertEqual(
+                youtubers, f"# YouTubers\n\n{URL}UCold # Old - Topic\n{URL}UCteach # Teacher\n"
+            )
+            self.assertIn("warning: override says UCold", out)
+            self.assertIn("by hand", out)
+
+    def test_bad_overrides_exit_2_before_fetch_and_touch_nothing(self):
+        for text in ("UCa band\n", "UCa\n", "UCa musician\nUCa youtuber\n"):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as d:
+                self.write(d, "overrides.txt", text)
+                self.write(d, "youtubers.md", f"{URL}UCgone # Gone\n")
+                fetched = []
+                code, out, err = self.run_cli("--output-dir", d, fetch=lambda: fetched.append(1) or [ch("UCn", "N")])  # noqa: B023
+                self.assertEqual(code, 2)
+                self.assertEqual(fetched, [])  # no API quota spent on a config typo
+                self.assertIn(os.path.join(d, "overrides.txt") + ":", err)
+                self.assertEqual(out, "")
+                self.assertEqual(sorted(os.listdir(d)), ["overrides.txt", "youtubers.md"])
+                self.assertEqual(_read_bytes(os.path.join(d, "youtubers.md")), f"{URL}UCgone # Gone\n".encode())
+
+    def test_unreadable_overrides_is_exit_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "overrides.txt"))
+            code, _, err = self.run_cli("--output-dir", d, fetch=lambda: [ch("UCn", "N")])
+            self.assertEqual(code, 2)
+            self.assertIn("overrides.txt", err)
+            self.assertEqual(os.listdir(d), ["overrides.txt"])
+
+
 if __name__ == "__main__":
     unittest.main()
