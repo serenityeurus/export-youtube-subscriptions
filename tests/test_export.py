@@ -1,13 +1,18 @@
 """Offline tests: no network, no Google libraries required."""
 
+import ast
 import io
 import json
 import os
+import re
 import stat
+import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1207,6 +1212,655 @@ class Issue3CliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("overrides.txt", err)
             self.assertEqual(os.listdir(d), ["overrides.txt"])
+
+
+# --------------------------------------------------------------------------
+# Issue #4: API fetch, OAuth and the full CLI
+# --------------------------------------------------------------------------
+
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+GOOGLE_TOP_LEVEL = ("google", "googleapiclient", "google_auth_oauthlib")
+
+
+class ScriptedYouTube:
+    """Fake resource that replays canned responses and records every call.
+
+    A response that is an Exception is raised from ``execute()``, the way
+    googleapiclient raises HttpError.
+    """
+
+    def __init__(self, sub_pages, chan_responses=None):
+        self.sub_pages = list(sub_pages)
+        self.chan_responses = chan_responses
+        self.sub_calls = []
+        self.chan_calls = []
+
+    def subscriptions(self):
+        return _Scripted(self.sub_calls, self.sub_pages)
+
+    def channels(self):
+        return _Scripted(self.chan_calls, self.chan_responses)
+
+
+class _Scripted:
+    def __init__(self, calls, responses):
+        self.calls, self.responses = calls, responses
+
+    def list(self, **kw):
+        self.calls.append(kw)
+        if self.responses is None:  # channels.list: no details for anyone
+            return _Req({"items": []})
+        return self
+
+    def execute(self):
+        resp = self.responses.pop(0)
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
+
+
+def sub_page(ids, next_token=None):
+    page = {"items": [{"snippet": {"title": f"Sub {i}", "resourceId": {"channelId": i}}} for i in ids]}
+    if next_token:
+        page["nextPageToken"] = next_token
+    return page
+
+
+class Issue4FetchTests(unittest.TestCase):
+    def test_request_parameters(self):
+        yt = FakeYouTube(60)
+        eys.fetch_channels(yt)
+        first, second = yt.sub_calls
+        self.assertEqual(first, {"part": "snippet", "mine": True, "maxResults": 50, "order": "alphabetical"})
+        self.assertEqual(second["pageToken"], "50")  # the token is passed back verbatim
+        yt = ScriptedYouTube([sub_page(["UCa", "UCb"])])
+        eys.fetch_channels(yt)
+        self.assertEqual(yt.chan_calls, [{"part": "snippet,topicDetails", "id": "UCa,UCb", "maxResults": 50}])
+
+    def test_page_and_batch_boundaries(self):
+        for count, pages, batches in ((1, 1, [1]), (50, 1, [50]), (51, 2, [50, 1]), (100, 2, [50, 50])):
+            with self.subTest(count=count):
+                yt = FakeYouTube(count)
+                chans = eys.fetch_channels(yt)
+                self.assertEqual([c.id for c in chans], yt.ids)  # API order kept across pages
+                self.assertEqual(len(yt.sub_calls), pages)
+                self.assertEqual([len(b) for b in yt.chan_calls], batches)
+
+    def test_duplicate_and_malformed_items_are_skipped(self):
+        junk = [{"snippet": {"title": "no id"}}, {"snippet": None}, {}]
+        pages = [sub_page(["UCa", "UCb"], "t1"), {"items": sub_page(["UCb", "UCc"])["items"] + junk}]
+        yt = ScriptedYouTube(pages)
+        self.assertEqual([c.id for c in eys.fetch_channels(yt)], ["UCa", "UCb", "UCc"])
+        self.assertEqual(yt.chan_calls[0]["id"], "UCa,UCb,UCc")
+
+    def test_null_fields_are_tolerated(self):
+        chan = {"id": "UCa", "snippet": None, "topicDetails": {"topicIds": None, "topicCategories": None}}
+        yt = ScriptedYouTube([sub_page(["UCa"])], [{"items": [chan, {"id": "UCstranger"}]}])
+        self.assertEqual(eys.fetch_channels(yt), [Channel("UCa", "Sub UCa", [], [])])
+        self.assertEqual(eys.fetch_channels(ScriptedYouTube([{"items": None}], [{"items": None}])), [])
+
+    def test_topics_come_from_channels_list(self):
+        details = {"topicIds": ["/m/04rlf"], "topicCategories": [WIKI + "Music"]}
+        chan = {"id": "UCa", "snippet": {"title": "New\nName"}, "topicDetails": details}
+        yt = ScriptedYouTube([sub_page(["UCa"])], [{"items": [chan]}])
+        self.assertEqual(eys.fetch_channels(yt), [Channel("UCa", "New Name", ["/m/04rlf"], [WIKI + "Music"])])
+
+    def test_repeated_page_token_aborts_instead_of_looping(self):
+        yt = ScriptedYouTube([sub_page(["UCa"], "same"), sub_page(["UCb"], "same"), sub_page(["UCc"], "same")])
+        with self.assertRaisesRegex(RuntimeError, "repeated page token"):
+            eys.fetch_channels(yt)
+        self.assertEqual(len(yt.sub_calls), 2)
+
+    def test_errors_propagate(self):
+        with self.assertRaisesRegex(OSError, "page 2"):
+            eys.fetch_channels(ScriptedYouTube([sub_page(["UCa"], "t1"), OSError("page 2")]))
+        with self.assertRaisesRegex(OSError, "batch"):
+            eys.fetch_channels(ScriptedYouTube([sub_page(["UCa"])], [OSError("batch")]))
+
+    def test_injected_resource_skips_auth(self):
+        # No client secrets, no token, no Google libraries: none are needed.
+        chans = eys.fetch_from_api("/nonexistent/cs.json", "/nonexistent/token.json", youtube=FakeYouTube(3))
+        self.assertEqual(len(chans), 3)
+
+
+class Issue4CliTests(unittest.TestCase):
+    setUp, tearDown = CliTests.setUp, CliTests.tearDown
+
+    def run_cli(self, *argv, youtube=None, environ=None):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = eys.main(
+                list(argv),
+                environ=self.env if environ is None else environ,
+                script_dir=self.script_dir,
+                youtube=youtube,
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def write(self, directory, name, text):
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def fixture(self, data):
+        return self.write(self.sandbox, "subs.json", data if isinstance(data, str) else json.dumps(data))
+
+    def snapshot(self, directory):
+        return {name: _read_bytes(os.path.join(directory, name)) for name in sorted(os.listdir(directory))}
+
+    # ---- fake API through the whole CLI ----------------------------------
+
+    def test_fake_api_end_to_end(self):
+        out_dir = os.path.join(self.sandbox, "out")
+        yt = FakeYouTube(123)
+        code, out, err = self.run_cli("--output-dir", out_dir, "--date", TODAY, youtube=yt)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual((len(yt.sub_calls), [len(b) for b in yt.chan_calls]), (3, [50, 50, 23]))
+        self.assertIn("fetched 123 subscriptions\n", out)
+        musicians = eys.read_text(os.path.join(out_dir, "musicians.md")).splitlines()
+        youtubers = eys.read_text(os.path.join(out_dir, "youtubers.md")).splitlines()
+        self.assertEqual((musicians[0], youtubers[0]), ("# Musicians", "# YouTubers"))
+        self.assertEqual(len(musicians) + len(youtubers) - 4, 123)
+        self.assertIn(f"{URL}{yt.ids[1]} # Chan {yt.ids[1]}", musicians)  # tagged Music
+        self.assertIn(f"{URL}{yt.ids[7]} # Sub {yt.ids[7]}", youtubers)  # no channels.list item
+        before = self.snapshot(out_dir)
+        code, out, _ = self.run_cli("--output-dir", out_dir, "--date", LATER, youtube=FakeYouTube(123))
+        self.assertEqual(code, 0)
+        self.assertIn("+0 added, 0 newly missing", out)
+        self.assertEqual(self.snapshot(out_dir), before)
+
+    def test_api_errors_exit_1_and_touch_nothing(self):
+        failures = {
+            "second page": ScriptedYouTube([sub_page(["UCa"], "t1"), OSError("network down")]),
+            "channels.list": ScriptedYouTube([sub_page(["UCa"])], [RuntimeError("quotaExceeded")]),
+            "token loop": ScriptedYouTube([sub_page(["UCa"], "t"), sub_page(["UCb"], "t")]),
+        }
+        for name, yt in failures.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                self.write(d, "youtubers.md", f"{URL}UCold # Old\n")
+                before = self.snapshot(d)
+                code, out, err = self.run_cli("--output-dir", d, "--date", TODAY, youtube=yt)
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn("error: failed to fetch subscriptions:", err)
+                self.assertEqual(self.snapshot(d), before)
+        missing_dir = os.path.join(self.sandbox, "never")
+        code, _, _ = self.run_cli("--output-dir", missing_dir, youtube=ScriptedYouTube([OSError("x")]))
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(missing_dir))
+
+    def test_empty_list_guard(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, "musicians.md", f"# Musicians\n\n{URL}UCa # A\n")
+            before = self.snapshot(d)
+            for extra in ((), ("--dry-run",)):
+                code, out, err = self.run_cli("--output-dir", d, *extra, youtube=FakeYouTube(0))
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("0 subscriptions", err)
+                self.assertEqual(self.snapshot(d), before)
+            code, out, _ = self.run_cli("--output-dir", d, "--allow-empty", "--date", TODAY, youtube=FakeYouTube(0))
+            self.assertEqual(code, 0)
+            self.assertIn("musicians.md: 1 channels, +0 added, 1 newly missing", out)
+            self.assertEqual(
+                eys.read_text(os.path.join(d, "musicians.md")),
+                f"# Musicians\n\n{URL}UCa # A [missing since {TODAY}]\n",
+            )
+
+    def test_empty_list_with_no_channels_on_file_is_fine(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, "youtubers.md", "# YouTubers\n\nnotes only\n")
+            before = self.snapshot(d)
+            code, out, _ = self.run_cli("--output-dir", d, youtube=FakeYouTube(0))
+            self.assertEqual(code, 0)
+            self.assertIn("fetched 0 subscriptions", out)
+            self.assertEqual(self.snapshot(d), before)  # and no empty musicians.md appears
+
+    # ---- output format ----------------------------------------------------
+
+    def test_summary_matches_readme_format(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, "musicians.md", f"# Musicians\n\n{URL}UCm1 # M1\n{URL}UCm2 # M2\n{URL}UCm3 # M3\n")
+            self.write(d, "youtubers.md", f"# YouTubers\n\n{URL}UCy1 # Y1\n{URL}UCy2 # Y2\n{URL}UCgone # Gone\n")
+            names = {"UCm1": "M1", "UCm2": "M2", "UCm3": "M3", "UCy1": "Y1", "UCy2": "Y2"}
+            subs = [{"id": i, "title": t} for i, t in names.items()]
+            subs += [{"id": "UCn1", "title": "N1 - Topic"}, {"id": "UCn2", "title": "N2VEVO"}]
+            argv = ("--output-dir", d, "--from-json", self.fixture(subs), "--date", TODAY)
+            code, out, err = self.run_cli(*argv, "--dry-run")
+            self.assertEqual((code, err), (0, ""))
+            self.assertEqual(
+                out.splitlines(),
+                [
+                    "env file: none",
+                    f"output dir: {os.path.abspath(d)} (from --output-dir)",
+                    "fetched 7 subscriptions",
+                    "musicians.md: 5 channels, +2 added, 0 newly missing, 0 still missing, 0 restored, 0 renamed",
+                    "youtubers.md: 3 channels, +0 added, 1 newly missing, 0 still missing, 0 restored, 0 renamed",
+                    "dry run: no files written",
+                ],
+            )
+            code, verbose_out, _ = self.run_cli(*argv, "--verbose")
+            self.assertEqual(code, 0)
+            expected_lines = (
+                "  musicians.md added: UCn1",
+                "  musicians.md added: UCn2",
+                "  youtubers.md newly missing: UCgone",
+            )
+            for line in expected_lines:
+                self.assertIn(line, verbose_out.splitlines())
+            self.assertNotIn("UCn1", out)  # ids only with -v
+
+    def test_verbose_lists_restored_and_renamed(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, "youtubers.md", f"{URL}UCback # Back [missing since 2026-01-01]\n{URL}UCren # Old\n")
+            subs = [{"id": "UCback", "title": "Back"}, {"id": "UCren", "title": "New"}]
+            code, out, _ = self.run_cli("--output-dir", d, "--from-json", self.fixture(subs), "-v")
+            self.assertEqual(code, 0)
+            self.assertIn(
+                "youtubers.md: 2 channels, +0 added, 0 newly missing, 0 still missing, 1 restored, 1 renamed", out
+            )
+            self.assertIn("  youtubers.md restored: UCback", out)
+            self.assertIn("  youtubers.md renamed: UCren", out)
+
+    def test_date_defaults_to_today(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, "youtubers.md", f"{URL}UCgone # Gone\n")
+            code, _, _ = self.run_cli("--output-dir", d, "--from-json", self.fixture([{"id": "UCa", "title": "A"}]))
+            self.assertEqual(code, 0)
+            today = eys._dt.date.today().isoformat()
+            self.assertIn(f"{URL}UCgone # Gone [missing since {today}]", eys.read_text(os.path.join(d, "youtubers.md")))
+
+    # ---- exit code 2: usage and config ------------------------------------
+
+    def test_bad_date_is_usage_error(self):
+        for bad in ("2026-13-01", "2026-02-30", "20261115", "2026-1-5", "tomorrow", "2026-11-15T00:00"):
+            with self.subTest(bad), tempfile.TemporaryDirectory() as d:
+                code, out, err = self.run_cli("--output-dir", d, "--date", bad, youtube=FakeYouTube(1))
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("--date", err)
+                self.assertEqual(os.listdir(d), [])
+
+    def test_argparse_usage_errors_exit_2_and_help_exits_0(self):
+        for argv, expected in ((["--bogus"], 2), (["--date"], 2), (["stray"], 2), (["--help"], 0), (["-h"], 0)):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit) as caught:
+                self.run_cli(*argv)
+            self.assertEqual(caught.exception.code, expected)
+
+    def test_help_documents_every_readme_option(self):
+        text = eys.build_parser().format_help()
+        for option in ("--output-dir", "--client-secrets", "--token", "--env-file", "--no-browser", "--dry-run",
+                       "--allow-empty", "-v, --verbose", "--from-json", "--date"):
+            self.assertIn(option, text)
+
+    def test_bad_fixture_is_usage_error(self):
+        bad_fixtures = {
+            "not json": "{nope",
+            "empty file": "",
+            "not a list": {"id": "UCa", "title": "A"},
+            "item not an object": ["UCa"],
+            "missing id": [{"title": "A"}],
+            "null id": [{"id": None, "title": "A"}],
+            "id would break the line format": [{"id": "UC a # x", "title": "A"}],
+            "numeric title": [{"id": "UCa", "title": 7}],
+            "topics not a list": [{"id": "UCa", "title": "A", "topicIds": "/m/04rlf"}],
+        }
+        for name, data in bad_fixtures.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                self.write(d, "youtubers.md", f"{URL}UCold # Old\n")
+                before = self.snapshot(d)
+                code, out, err = self.run_cli("--output-dir", d, "--from-json", self.fixture(data))
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("--from-json fixture", err)
+                self.assertEqual(self.snapshot(d), before)
+        code, _, err = self.run_cli("--from-json", os.path.join(self.sandbox, "missing.json"))
+        self.assertEqual(code, 2)
+        self.assertIn("missing.json", err)
+
+    def test_fixture_optional_fields(self):
+        subs = [{"id": "UCa"}, {"id": "UCb", "title": None, "topicIds": None, "topicCategories": None}]
+        chans = eys.load_json_channels(self.fixture(subs))
+        self.assertEqual(chans, [Channel("UCa", "", [], []), Channel("UCb", "", [], [])])
+
+    def test_unreadable_existing_file_is_exit_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "musicians.md"), "wb") as f:
+                f.write(b"\xff\xfe not utf-8\n")
+            before = self.snapshot(d)
+            code, out, err = self.run_cli("--output-dir", d, youtube=FakeYouTube(2))
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("cannot read the existing files", err)
+            self.assertEqual(self.snapshot(d), before)
+
+    def test_write_failure_is_exit_2_not_a_traceback(self):
+        def refuse(path, text):
+            raise PermissionError(13, "Permission denied", path)
+
+        original, eys.atomic_write = eys.atomic_write, refuse
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                code, _, err = self.run_cli("--output-dir", d, youtube=FakeYouTube(2))
+                self.assertEqual(code, 2)
+                self.assertIn("cannot write", err)
+                self.assertEqual(os.listdir(d), [])
+        finally:
+            eys.atomic_write = original
+
+    def test_missing_google_libraries_is_exit_2_with_install_hint(self):
+        blocked = dict.fromkeys(GOOGLE_TOP_LEVEL)  # None in sys.modules makes the import fail
+        with mock.patch.dict(sys.modules, blocked), tempfile.TemporaryDirectory() as d:
+            code, out, err = self.run_cli("--output-dir", d, "--token", os.path.join(d, "token.json"))
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("requirements.txt", err)
+            self.assertEqual(os.listdir(d), [])
+
+
+# ---- OAuth, exercised against stand-ins for the Google libraries ----------
+
+
+class FakeCreds:
+    def __init__(self, valid=True, expired=False, refresh_token="refresh-token", refresh_error=None):
+        self.valid, self.expired, self.refresh_token = valid, expired, refresh_token
+        self.refresh_error = refresh_error
+        self.refreshed = 0
+
+    def refresh(self, request):
+        self.refreshed += 1
+        if self.refresh_error:
+            raise self.refresh_error
+        self.valid, self.expired = True, False
+
+    def to_json(self):
+        return json.dumps({"refresh_token": self.refresh_token})
+
+
+class FakeGoogle:
+    """Just enough of google-auth / google-auth-oauthlib / googleapiclient to
+    run get_credentials() and build_youtube() offline, recording what they ask for."""
+
+    class RefreshError(Exception):
+        pass
+
+    def __init__(self, cached=None, fresh=None, resource=None):
+        self.cached = cached  # what the token file "contains"; an Exception is raised
+        self.fresh = fresh or FakeCreds()  # what the interactive flow returns
+        self.resource = resource
+        self.calls = []
+
+    def _load_token(self, path, scopes):
+        self.calls.append(("load_token", path, tuple(scopes)))
+        if isinstance(self.cached, Exception):
+            raise self.cached
+        return self.cached
+
+    def _flow(self, path, scopes):
+        self.calls.append(("flow", path, tuple(scopes)))
+        with open(path, encoding="utf-8") as f:
+            json.load(f)["installed"]  # the real library rejects non-Desktop files too
+        return self
+
+    def run_local_server(self, **kwargs):
+        self.calls.append(("run_local_server", kwargs))
+        return self.fresh
+
+    def _build(self, service, version, **kwargs):
+        self.calls.append(("build", service, version, kwargs))
+        return self.resource
+
+    def modules(self):
+        def module(name, **attrs):
+            mod = types.ModuleType(name)
+            mod.__dict__.update(attrs)
+            return mod
+
+        mods = [
+            module("google"),
+            module("google.auth"),
+            module("google.auth.exceptions", RefreshError=self.RefreshError),
+            module("google.auth.transport"),
+            module("google.auth.transport.requests", Request=object),
+            module("google.oauth2"),
+            module("google.oauth2.credentials", Credentials=module("C", from_authorized_user_file=self._load_token)),
+            module("google_auth_oauthlib"),
+            module("google_auth_oauthlib.flow", InstalledAppFlow=module("F", from_client_secrets_file=self._flow)),
+            module("googleapiclient"),
+            module("googleapiclient.discovery", build=self._build),
+        ]
+        return {mod.__name__: mod for mod in mods}
+
+    def names(self):
+        return [call[0] for call in self.calls]
+
+
+class Issue4AuthTests(unittest.TestCase):
+    READONLY = ("https://www.googleapis.com/auth/youtube.readonly",)
+
+    def setUp(self):
+        self._sandbox = tempfile.TemporaryDirectory()
+        self.addCleanup(self._sandbox.cleanup)
+        self.sandbox = self._sandbox.name
+        self.secrets = os.path.join(self.sandbox, "client_secret.json")
+        with open(self.secrets, "w", encoding="utf-8") as f:
+            json.dump({"installed": {"client_id": "fake"}}, f)
+        self.token = os.path.join(self.sandbox, "config", "token.json")
+
+    def install(self, google):
+        patcher = mock.patch.dict(sys.modules, google.modules())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return google
+
+    def cache_token(self, mode=0o600):
+        os.makedirs(os.path.dirname(self.token), exist_ok=True)
+        with open(self.token, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.chmod(self.token, mode)
+
+    def mode(self, path):
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+    def credentials(self, **kwargs):
+        with redirect_stderr(io.StringIO()) as err:
+            creds = eys.get_credentials(self.secrets, self.token, **kwargs)
+        return creds, err.getvalue()
+
+    def test_scope_is_read_only(self):
+        self.assertEqual(tuple(eys.SCOPES), self.READONLY)
+
+    def test_first_run_runs_installed_app_flow_and_caches_token_0600(self):
+        google = self.install(FakeGoogle())
+        creds, _ = self.credentials()
+        self.assertIs(creds, google.fresh)
+        self.assertEqual(google.calls[0], ("flow", self.secrets, self.READONLY))
+        self.assertEqual(google.calls[1], ("run_local_server", {"port": 0, "open_browser": True}))
+        self.assertEqual(json.loads(eys.read_text(self.token)), {"refresh_token": "refresh-token"})
+        self.assertEqual(self.mode(self.token), 0o600)
+        self.assertEqual(self.mode(os.path.dirname(self.token)), 0o700)
+
+    def test_no_browser_prints_url_instead(self):
+        google = self.install(FakeGoogle())
+        self.credentials(open_browser=False)
+        self.assertEqual(google.calls[1], ("run_local_server", {"port": 0, "open_browser": False}))
+
+    def test_valid_cached_token_needs_no_flow_and_no_client_secrets(self):
+        self.cache_token()
+        cached = FakeCreds(valid=True)
+        google = self.install(FakeGoogle(cached=cached))
+        os.unlink(self.secrets)
+        creds, _ = self.credentials()
+        self.assertIs(creds, cached)
+        self.assertEqual(google.calls, [("load_token", self.token, self.READONLY)])
+        self.assertEqual(eys.read_text(self.token), "{}")  # not rewritten
+
+    def test_expired_token_is_refreshed_and_saved_0600_even_if_it_was_looser(self):
+        self.cache_token(mode=0o644)
+        cached = FakeCreds(valid=False, expired=True)
+        google = self.install(FakeGoogle(cached=cached))
+        creds, _ = self.credentials()
+        self.assertIs(creds, cached)
+        self.assertEqual((cached.refreshed, google.names()), (1, ["load_token"]))
+        self.assertEqual(self.mode(self.token), 0o600)
+        self.assertIn("refresh-token", eys.read_text(self.token))
+
+    def test_dead_refresh_token_falls_back_to_the_flow(self):
+        # README: testing-mode refresh tokens expire after about 7 days.
+        self.cache_token()
+        cached = FakeCreds(valid=False, expired=True, refresh_error=FakeGoogle.RefreshError("invalid_grant"))
+        google = self.install(FakeGoogle(cached=cached))
+        creds, err = self.credentials()
+        self.assertIs(creds, google.fresh)
+        self.assertEqual(google.names(), ["load_token", "flow", "run_local_server"])
+        self.assertIn("invalid_grant", err)
+
+    def test_token_without_refresh_token_falls_back_to_the_flow(self):
+        self.cache_token()
+        cached = FakeCreds(valid=False, expired=True, refresh_token=None)
+        google = self.install(FakeGoogle(cached=cached))
+        creds, _ = self.credentials()
+        self.assertIs(creds, google.fresh)
+        self.assertEqual(cached.refreshed, 0)
+
+    def test_corrupt_token_file_falls_back_to_the_flow(self):
+        self.cache_token()
+        google = self.install(FakeGoogle(cached=ValueError("missing fields refresh_token")))
+        creds, err = self.credentials()
+        self.assertIs(creds, google.fresh)
+        self.assertIn("ignoring unusable token", err)
+        self.assertEqual(self.mode(self.token), 0o600)
+
+    def test_network_error_while_refreshing_propagates(self):
+        self.cache_token()
+        cached = FakeCreds(valid=False, expired=True, refresh_error=OSError("no route to host"))
+        google = self.install(FakeGoogle(cached=cached))
+        with self.assertRaisesRegex(OSError, "no route"):
+            self.credentials()
+        self.assertEqual(google.names(), ["load_token"])  # no surprise browser flow
+        self.assertEqual(eys.read_text(self.token), "{}")
+
+    def test_missing_or_invalid_client_secrets_is_usage_error(self):
+        self.install(FakeGoogle())
+        with open(self.secrets, "w", encoding="utf-8") as f:
+            f.write('{"web": {}}')
+        with self.assertRaisesRegex(eys.UsageError, "cannot use OAuth client secrets"):
+            self.credentials()
+        os.unlink(self.secrets)
+        with self.assertRaisesRegex(eys.UsageError, "client secrets not found"):
+            self.credentials()
+        self.assertFalse(os.path.exists(self.token))
+
+    def test_save_token_bare_filename(self):
+        old = os.getcwd()
+        os.chdir(self.sandbox)
+        try:
+            eys._save_token("token.json", FakeCreds())
+        finally:
+            os.chdir(old)
+        self.assertEqual(self.mode(os.path.join(self.sandbox, "token.json")), 0o600)
+
+    # ---- through main(): flags, default token path, exit codes -------------
+
+    def run_cli(self, *argv):
+        home = os.path.join(self.sandbox, "home")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = eys.main(
+                ["--output-dir", os.path.join(self.sandbox, "out"), "--date", TODAY, *argv],
+                environ={"HOME": home, "XDG_CONFIG_HOME": os.path.join(self.sandbox, "xdg")},
+                script_dir=os.path.join(self.sandbox, "bin"),
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_cli_authenticates_builds_v3_client_and_fetches(self):
+        google = self.install(FakeGoogle(resource=FakeYouTube(3)))
+        code, out, err = self.run_cli("--client-secrets", self.secrets, "--no-browser")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("fetched 3 subscriptions", out)
+        self.assertEqual(google.calls[1], ("run_local_server", {"port": 0, "open_browser": False}))
+        service, version, kwargs = google.calls[2][1:]
+        self.assertEqual((service, version, kwargs["credentials"]), ("youtube", "v3", google.fresh))
+        default_token = os.path.join(self.sandbox, "xdg", "export-youtube-subscriptions", "token.json")
+        self.assertEqual(self.mode(default_token), 0o600)  # $XDG_CONFIG_HOME default
+        self.assertTrue(os.path.isfile(os.path.join(self.sandbox, "out", "youtubers.md")))
+
+    def test_cli_token_flag_and_browser_default(self):
+        google = self.install(FakeGoogle(resource=FakeYouTube(1)))
+        code, _, _ = self.run_cli("--client-secrets", self.secrets, "--token", self.token)
+        self.assertEqual(code, 0)
+        self.assertEqual(google.calls[1], ("run_local_server", {"port": 0, "open_browser": True}))
+        self.assertEqual(self.mode(self.token), 0o600)
+        self.assertFalse(os.path.exists(os.path.join(self.sandbox, "xdg")))
+
+    def test_cli_exit_codes_for_auth_problems(self):
+        out_dir = os.path.join(self.sandbox, "out")
+        self.install(FakeGoogle())
+        code, _, err = self.run_cli("--client-secrets", os.path.join(self.sandbox, "nope.json"))
+        self.assertEqual(code, 2)
+        self.assertIn("client secrets not found", err)
+        self.assertFalse(os.path.exists(out_dir))
+
+        self.cache_token()
+        dead = FakeCreds(valid=False, expired=True, refresh_error=OSError("no route to host"))
+        self.install(FakeGoogle(cached=dead))
+        code, _, err = self.run_cli("--client-secrets", self.secrets, "--token", self.token)
+        self.assertEqual(code, 1)
+        self.assertIn("no route to host", err)
+        self.assertFalse(os.path.exists(out_dir))
+
+
+class Issue4PackagingTests(unittest.TestCase):
+    def read(self, name):
+        with open(os.path.join(REPO_DIR, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_google_libraries_are_only_imported_inside_functions(self):
+        tree = ast.parse(self.read("export_youtube_subscriptions.py"))
+        top_level = []
+        for node in tree.body:  # module scope only: imports inside functions are the lazy ones
+            if isinstance(node, ast.Import):
+                top_level += [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                top_level.append(node.module or "")
+        self.assertTrue(top_level)
+        self.assertEqual([name for name in top_level if name.split(".")[0] in GOOGLE_TOP_LEVEL], [])
+        lazy = [
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in GOOGLE_TOP_LEVEL
+        ]
+        self.assertIn("googleapiclient.discovery", lazy)
+        self.assertIn("google_auth_oauthlib.flow", lazy)
+
+    def test_offline_run_never_imports_google_libraries(self):
+        script = (
+            "import sys, export_youtube_subscriptions as eys\n"
+            "code = eys.main(['--dry-run', '--from-json', sys.argv[1], '--output-dir', sys.argv[2]],"
+            " environ={'HOME': sys.argv[2]}, script_dir=sys.argv[2])\n"
+            f"loaded = sorted(m for m in sys.modules if m.split('.')[0] in {GOOGLE_TOP_LEVEL!r})\n"
+            "sys.exit(code or (3 if loaded else 0))\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            fixture = os.path.join(d, "subs.json")
+            with open(fixture, "w", encoding="utf-8") as f:
+                json.dump([{"id": "UCa", "title": "A"}], f)
+            done = subprocess.run(
+                [sys.executable, "-c", script, fixture, d], cwd=REPO_DIR, capture_output=True, text=True
+            )
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_entry_point_pep723_block_matches_requirements_txt(self):
+        entry = self.read("export-youtube-subscriptions").splitlines()
+        self.assertTrue(entry[0].startswith("#!") and "uv run --script" in entry[0], entry[0])
+        start, end = entry.index("# /// script"), entry.index("# ///")
+        block = "\n".join(line[2:] for line in entry[start + 1 : end])
+        self.assertRegex(block, r'(?m)^requires-python = ">=3\.9"$')
+        inline = re.search(r"(?s)^dependencies = \[(.*?)\]", block, re.M).group(1)
+        inline_deps = re.findall(r'"([^"]+)"', inline)
+        requirements = [
+            line.strip()
+            for line in self.read("requirements.txt").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(sorted(inline_deps), sorted(requirements))
+        for package in ("google-api-python-client", "google-auth-oauthlib"):
+            self.assertTrue(any(dep.startswith(package) for dep in inline_deps), package)
 
 
 if __name__ == "__main__":

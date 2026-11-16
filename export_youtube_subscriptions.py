@@ -103,6 +103,15 @@ class EmptySubscriptionsError(RuntimeError):
     """Raised when the API returned nothing but the files list channels."""
 
 
+class UsageError(Exception):
+    """A usage/config problem found while getting subscriptions (exit code 2).
+
+    Distinguishes "fix your setup" (missing client secrets, Google libraries
+    not installed, a bad ``--from-json`` fixture) from API/auth/network
+    failures, which exit 1.
+    """
+
+
 # --------------------------------------------------------------------------
 # Line format
 # --------------------------------------------------------------------------
@@ -521,6 +530,9 @@ def load_overrides(output_dir: str) -> Dict[str, str]:
 # --------------------------------------------------------------------------
 
 
+PAGE_SIZE = 50  # the API maximum for subscriptions.list pages and channels.list id batches
+
+
 def _chunks(items: Sequence[str], n: int) -> Iterable[Sequence[str]]:
     for i in range(0, len(items), n):
         yield items[i : i + n]
@@ -535,14 +547,16 @@ def fetch_channels(youtube) -> List[Channel]:
     subs: List[Channel] = []
     seen = set()
     page_token = None
+    seen_tokens = set()
     while True:
-        kwargs = dict(part="snippet", mine=True, maxResults=50, order="alphabetical")
+        kwargs = dict(part="snippet", mine=True, maxResults=PAGE_SIZE, order="alphabetical")
         if page_token:
             kwargs["pageToken"] = page_token
         resp = youtube.subscriptions().list(**kwargs).execute()
-        for item in resp.get("items", []):
-            snip = item.get("snippet", {})
-            cid = snip.get("resourceId", {}).get("channelId")
+        # "or": the API (and fakes) may send an explicit null instead of omitting a key.
+        for item in resp.get("items") or []:
+            snip = item.get("snippet") or {}
+            cid = (snip.get("resourceId") or {}).get("channelId")
             if not cid or cid in seen:
                 continue
             seen.add(cid)
@@ -550,40 +564,59 @@ def fetch_channels(youtube) -> List[Channel]:
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
+        # A token that comes back twice would loop forever and burn the daily
+        # quota; fail the run (exit 1, no files touched) instead.
+        if page_token in seen_tokens:
+            raise RuntimeError(f"subscriptions.list repeated page token {page_token!r}; aborting")
+        seen_tokens.add(page_token)
 
     by_id = {c.id: c for c in subs}
-    for batch in _chunks([c.id for c in subs], 50):
+    for batch in _chunks([c.id for c in subs], PAGE_SIZE):
         resp = (
             youtube.channels()
-            .list(part="snippet,topicDetails", id=",".join(batch), maxResults=50)
+            .list(part="snippet,topicDetails", id=",".join(batch), maxResults=PAGE_SIZE)
             .execute()
         )
-        for item in resp.get("items", []):
+        for item in resp.get("items") or []:
             ch = by_id.get(item.get("id"))
             if ch is None:
                 continue
-            title = clean_name(item.get("snippet", {}).get("title", ""))
+            title = clean_name((item.get("snippet") or {}).get("title", ""))
             if title:
                 ch.title = title
-            td = item.get("topicDetails", {}) or {}
-            ch.topic_ids = list(td.get("topicIds", []) or [])
-            ch.topic_categories = list(td.get("topicCategories", []) or [])
+            td = item.get("topicDetails") or {}
+            ch.topic_ids = list(td.get("topicIds") or [])
+            ch.topic_categories = list(td.get("topicCategories") or [])
     return subs
 
 
 def load_json_channels(path: str) -> List[Channel]:
-    """Load a fixture: JSON list of {id, title, topicIds?, topicCategories?}."""
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    return [
-        Channel(
-            id=d["id"],
-            title=clean_name(d.get("title", "")),
-            topic_ids=list(d.get("topicIds") or []),  # tolerate an explicit null
-            topic_categories=list(d.get("topicCategories") or []),
-        )
-        for d in data
-    ]
+    """Load a fixture: JSON list of {id, title, topicIds?, topicCategories?}.
+
+    Raises UsageError (exit code 2) when the file is missing, isn't JSON or
+    doesn't have that shape: a bad fixture is a usage error, not an API failure.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:  # ValueError: bad JSON or not UTF-8
+        raise UsageError(f"cannot read --from-json fixture {path!r}: {e}") from e
+    if not isinstance(data, list):
+        raise UsageError(f"--from-json fixture {path!r}: expected a JSON list of channels")
+    channels = []
+    for index, entry in enumerate(data):
+        where = f"--from-json fixture {path!r}: item {index}"
+        if not isinstance(entry, dict):
+            raise UsageError(f"{where}: expected an object with 'id' and 'title'")
+        channel_id = entry.get("id")
+        if not isinstance(channel_id, str) or not _CHANNEL_ID_RE.fullmatch(channel_id):
+            raise UsageError(f"{where}: 'id' must be a channel id string, got {channel_id!r}")
+        title = entry.get("title") or ""
+        topics = [entry.get("topicIds") or [], entry.get("topicCategories") or []]  # tolerate null
+        if not isinstance(title, str) or not all(isinstance(t, list) for t in topics):
+            raise UsageError(f"{where}: 'title' must be a string, 'topicIds'/'topicCategories' lists")
+        channels.append(Channel(channel_id, clean_name(title), list(topics[0]), list(topics[1])))
+    return channels
 
 
 def default_token_path(environ=None) -> str:
@@ -594,8 +627,10 @@ def _save_token(path: str, creds) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
+        # Tighten before writing: a file that pre-existed with looser perms
+        # must never hold the token while still group/world readable.
+        os.chmod(path, 0o600)
         f.write(creds.to_json())
-    os.chmod(path, 0o600)  # in case the file pre-existed with looser perms
 
 
 def get_credentials(client_secrets: str, token_path: str, open_browser: bool = True):
@@ -606,7 +641,10 @@ def get_credentials(client_secrets: str, token_path: str, open_browser: bool = T
 
     creds = None
     if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        except ValueError as e:  # truncated/hand-edited token: same recovery as a dead one
+            print(f"ignoring unusable token {token_path!r} ({e}); re-authorising", file=sys.stderr)
     if creds and creds.valid:
         return creds
     if creds and creds.expired and creds.refresh_token:
@@ -617,21 +655,45 @@ def get_credentials(client_secrets: str, token_path: str, open_browser: bool = T
         except RefreshError as e:
             print(f"token refresh failed ({e}); re-authorising", file=sys.stderr)
     if not os.path.exists(client_secrets):
-        raise FileNotFoundError(
+        raise UsageError(
             f"OAuth client secrets not found at {client_secrets!r}; see README "
             "'Google Cloud setup' or pass --client-secrets"
         )
-    flow = InstalledAppFlow.from_client_secrets_file(client_secrets, SCOPES)
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(client_secrets, SCOPES)
+    except (OSError, ValueError, KeyError) as e:  # not JSON, or not a Desktop-app client file
+        raise UsageError(f"cannot use OAuth client secrets {client_secrets!r}: {type(e).__name__}: {e}") from e
+    # open_browser=False (--no-browser) makes the library print the URL instead.
     creds = flow.run_local_server(port=0, open_browser=open_browser)
     _save_token(token_path, creds)
     return creds
 
 
-def fetch_from_api(client_secrets: str, token_path: str, open_browser: bool = True) -> List[Channel]:
-    from googleapiclient.discovery import build
+def build_youtube(client_secrets: str, token_path: str, open_browser: bool = True):
+    """Authenticate and build the real ``youtube`` v3 resource.
 
-    creds = get_credentials(client_secrets, token_path, open_browser)
-    youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+    The only place (with get_credentials) that imports the Google libraries,
+    so everything else runs and tests without them installed.
+    """
+    try:
+        from googleapiclient.discovery import build
+
+        creds = get_credentials(client_secrets, token_path, open_browser)
+    except ImportError as e:
+        raise UsageError(
+            f"Google client libraries are not installed ({e}); run ./export-youtube-subscriptions "
+            "with uv, or 'python3 -m pip install -r requirements.txt'"
+        ) from e
+    return build("youtube", "v3", credentials=creds, cache_discovery=False)
+
+
+def fetch_from_api(
+    client_secrets: str, token_path: str, open_browser: bool = True, youtube=None
+) -> List[Channel]:
+    """Fetch via the API. ``youtube`` injects a ready resource (tests use a
+    fake); without it the real one is built, which authenticates first."""
+    if youtube is None:
+        youtube = build_youtube(client_secrets, token_path, open_browser)
     return fetch_channels(youtube)
 
 
@@ -898,13 +960,22 @@ def main(
     fetch=None,
     environ=None,
     script_dir: Optional[str] = None,
+    youtube=None,
 ) -> int:
     """CLI entry. ``environ``/``script_dir`` are injectable so tests never read
-    the developer's real env file or environment."""
+    the developer's real env file or environment; ``youtube`` injects the API
+    resource (a fake in tests) in place of OAuth + the real client, and
+    ``fetch`` replaces the whole subscription source."""
     args = build_parser().parse_args(argv)
     today = args.date or _dt.date.today().isoformat()
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", today):
-        print(f"error: --date must be YYYY-MM-DD, got {today!r}", file=sys.stderr)
+    try:
+        # The regex pins the form (3.11+ fromisoformat also takes 20261115);
+        # fromisoformat rejects impossible dates such as 2026-02-30.
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", today):
+            raise ValueError("wrong form")
+        _dt.date.fromisoformat(today)
+    except ValueError:
+        print(f"error: --date must be a real date as YYYY-MM-DD, got {today!r}", file=sys.stderr)
         return 2
     try:
         settings = resolve_settings(args, environ, script_dir)
@@ -931,15 +1002,21 @@ def main(
         elif args.from_json:
             channels = load_json_channels(args.from_json)
         else:
-            channels = fetch_from_api(settings.client_secrets, settings.token_path, not args.no_browser)
-    except FileNotFoundError as e:
+            channels = fetch_from_api(
+                settings.client_secrets, settings.token_path, not args.no_browser, youtube=youtube
+            )
+    except UsageError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     except Exception as e:  # API/auth/network errors: report, don't touch files
         print(f"error: failed to fetch subscriptions: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
-    existing = load_existing(out_dir)
+    try:
+        existing = load_existing(out_dir)
+    except (OSError, UnicodeDecodeError) as e:  # unreadable, a directory, not UTF-8
+        print(f"error: cannot read the existing files in {out_dir!r}: {e}", file=sys.stderr)
+        return 2
     try:
         result = merge(
             existing,
@@ -969,7 +1046,13 @@ def main(
             path = os.path.join(out_dir, FILENAMES[cat])
             if not lines and not os.path.exists(path):
                 continue  # don't create empty files
-            atomic_write(path, join_lines(lines))
+            try:
+                atomic_write(path, join_lines(lines))
+            except OSError as e:
+                # Each file is replaced atomically, but the pair is not: say
+                # which one failed so a half-applied run is easy to spot.
+                print(f"error: cannot write {path!r}: {e}", file=sys.stderr)
+                return 2
 
     print(f"env file: {settings.env_file or 'none'}")
     note = ""
