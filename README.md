@@ -51,7 +51,8 @@ On the first run, a browser opens for Google sign-in. Use `--no-browser` on a he
 | `--env-file PATH` | see [Env file](#env-file) | Settings file to read |
 | `--no-browser` | off | Print the auth URL instead of opening a browser |
 | `--dry-run` | off | Compute and print the summary without writing anything |
-| `--allow-empty` | off | Accept an empty subscription list (see Safety) |
+| `--allow-empty` | off | Accept an empty subscription list (see Safety). Implies `--allow-drop` |
+| `--allow-drop` | off | Let one run newly mark more than max(5, 20%) of the listed channels missing (see the drop guard under Exit codes) |
 | `-v, --verbose` | off | List the channel IDs added, missing, restored or renamed |
 | `--from-json PATH` | none | Read subscriptions from a JSON fixture instead of the API (for testing) |
 | `--date YYYY-MM-DD` | today | Date to use in new markers (for testing) |
@@ -70,7 +71,19 @@ Exit codes:
 
 - `0`: success
 - `1`: API, auth or network error. No files are touched.
-- `2`: usage or config error (bad or missing env file, output dir that can't be created), a bad `overrides.txt`, or the empty-list safety guard tripped.
+- `2`: usage or config error (bad or missing env file, output dir that can't be created), a bad `overrides.txt`, or a safety guard tripped (the empty-list guard or the drop guard). No files are touched.
+
+**Drop guard.** A partial API result would mark every channel it left out as missing. So a run refuses, before it writes anything, when it would newly mark more than max(5, 20%) of the listed channels missing. It prints the count and the threshold and exits with code 2:
+
+```
+error: 7 of 30 listed channel(s) would be newly marked missing, more than the drop threshold of 6 (the larger of 5 and 20%); the API result may be partial; refusing to write (pass --allow-drop if this is real)
+```
+
+- The 20% is taken of the channels that are listed in either file and not already marked missing. Channels that already have a marker count on neither side.
+- The floor of 5 means a short list never blocks ordinary pruning, and a first run (nothing listed yet) can't trip the guard.
+- `--allow-drop` skips the guard for that run. `--allow-empty` implies it.
+- `--dry-run` doesn't refuse. It prints the usual summary (add `-v` for the channel IDs) plus a `warning:` line saying a real run would refuse, and exits 0.
+- The threshold is the `DROP_THRESHOLD` constant in `export_youtube_subscriptions.py`.
 
 The `--from-json` fixture is a JSON list of `{"id", "title", "topicIds"?, "topicCategories"?}`.
 

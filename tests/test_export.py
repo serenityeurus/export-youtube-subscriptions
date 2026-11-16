@@ -21,6 +21,7 @@ from export_youtube_subscriptions import (  # noqa: E402
     MUSICIAN,
     YOUTUBER,
     Channel,
+    DropGuardError,
     EmptySubscriptionsError,
     classify,
     format_line,
@@ -1488,7 +1489,7 @@ class Issue4CliTests(unittest.TestCase):
     def test_help_documents_every_readme_option(self):
         text = eys.build_parser().format_help()
         for option in ("--output-dir", "--client-secrets", "--token", "--env-file", "--no-browser", "--dry-run",
-                       "--allow-empty", "-v, --verbose", "--from-json", "--date"):
+                       "--allow-empty", "--allow-drop", "-v, --verbose", "--from-json", "--date"):
             self.assertIn(option, text)
 
     def test_bad_fixture_is_usage_error(self):
@@ -1861,6 +1862,335 @@ class Issue4PackagingTests(unittest.TestCase):
         self.assertEqual(sorted(inline_deps), sorted(requirements))
         for package in ("google-api-python-client", "google-auth-oauthlib"):
             self.assertTrue(any(dep.startswith(package) for dep in inline_deps), package)
+
+
+def _listed(count, prefix="UCk", missing_since=None):
+    """``count`` channel lines with distinct ids, optionally already marked missing."""
+    return [format_line(f"{prefix}{i:03d}", f"N{i}", missing_since) for i in range(count)]
+
+
+def _kept(lines, dropped):
+    """The subscription list that drops the first ``dropped`` channels of ``lines``."""
+    return [ch(parse_line(line).id, parse_line(line).name) for line in lines[dropped:]]
+
+
+class Issue5DropThresholdTests(unittest.TestCase):
+    def test_default_is_the_larger_of_5_and_20_percent(self):
+        self.assertEqual(tuple(eys.DROP_THRESHOLD), (5, 20))
+
+    def test_limit_table(self):
+        # (active channels, most that may be newly marked missing)
+        for active, limit in ((0, 5), (1, 5), (5, 5), (25, 5), (29, 5), (30, 6), (34, 6), (35, 7), (100, 20),
+                              (1000, 200)):
+            with self.subTest(active=active):
+                self.assertEqual(eys.DROP_THRESHOLD.limit(active), limit)
+
+    def test_limit_matches_the_real_valued_rule(self):
+        # "more than max(5, 20%)" over whole channels, with no float rounding slip.
+        for active in range(0, 400):
+            limit = eys.DROP_THRESHOLD.limit(active)
+            for newly in (limit, limit + 1):
+                self.assertEqual(newly > limit, newly > 5 and newly * 100 > active * 20, (active, newly))
+
+
+class Issue5DropGuardMergeTests(unittest.TestCase):
+    def drop(self, listed, dropped, **kwargs):
+        lines = _listed(listed)
+        # One brand-new channel keeps the subscription list non-empty, so the
+        # empty-list guard is never the one that fires here.
+        subs = _kept(lines, dropped) + [ch("UCnew", "New")]
+        return merge({YOUTUBER: lines}, subs, TODAY, **kwargs)
+
+    def test_exactly_at_the_threshold_is_allowed(self):
+        for listed, dropped in ((30, 6), (100, 20), (35, 7)):
+            with self.subTest(listed=listed):
+                r = self.drop(listed, dropped)
+                self.assertEqual(len(r.summary[YOUTUBER].newly_missing), dropped)
+
+    def test_one_above_the_threshold_is_refused(self):
+        for listed, dropped, limit in ((30, 7, 6), (100, 21, 20), (35, 8, 7)):
+            with self.subTest(listed=listed), self.assertRaises(DropGuardError) as caught:
+                self.drop(listed, dropped)
+            e = caught.exception
+            self.assertEqual((e.newly_missing, e.active, e.limit), (dropped, listed, limit))
+            self.assertIn(f"{dropped} of {listed} listed channel(s)", str(e))
+            self.assertIn(f"drop threshold of {limit} ", str(e))
+
+    def test_percent_boundary_is_not_rounded_up(self):
+        # 20% of 26 is 5.2: six is already "more than", five is the floor.
+        self.assertEqual(len(self.drop(26, 5).summary[YOUTUBER].newly_missing), 5)
+        with self.assertRaises(DropGuardError):
+            self.drop(26, 6)
+
+    def test_small_list_floor(self):
+        # Up to 5 may always go, even when that is the whole list.
+        for listed in (1, 3, 5):
+            with self.subTest(listed=listed):
+                r = self.drop(listed, listed)
+                self.assertEqual(len(r.summary[YOUTUBER].newly_missing), listed)
+        self.assertEqual(len(self.drop(8, 5).summary[YOUTUBER].newly_missing), 5)
+        for listed in (6, 8, 25):
+            with self.subTest(listed=listed), self.assertRaises(DropGuardError) as caught:
+                self.drop(listed, 6)
+            self.assertEqual(caught.exception.limit, 5)
+
+    def test_allow_drop_bypasses(self):
+        r = self.drop(30, 30, allow_drop=True)
+        self.assertEqual(len(r.summary[YOUTUBER].newly_missing), 30)
+        self.assertTrue(all(line.endswith(f"[missing since {TODAY}]") for line in r.contents[YOUTUBER][:30]))
+
+    def test_allow_empty_implies_allow_drop(self):
+        self.assertEqual(len(self.drop(30, 30, allow_empty=True).summary[YOUTUBER].newly_missing), 30)
+        # ... and for the case it exists for: nothing came back at all.
+        r = merge({YOUTUBER: _listed(30)}, [], TODAY, allow_empty=True)
+        self.assertEqual(len(r.summary[YOUTUBER].newly_missing), 30)
+
+    def test_empty_list_still_hits_the_empty_guard_first(self):
+        with self.assertRaises(EmptySubscriptionsError):
+            merge({YOUTUBER: _listed(30)}, [], TODAY)
+        with self.assertRaises(EmptySubscriptionsError):  # --allow-drop is not --allow-empty
+            merge({YOUTUBER: _listed(30)}, [], TODAY, allow_drop=True)
+
+    def test_counts_across_both_files(self):
+        musicians, youtubers = _listed(15, "UCm"), _listed(15, "UCy")
+        existing = {MUSICIAN: musicians, YOUTUBER: youtubers}
+        # 3 + 3 = 6 of 30: at the threshold, though each file alone lost 20%.
+        r = merge(existing, _kept(musicians, 3) + _kept(youtubers, 3), TODAY)
+        self.assertEqual([len(s.newly_missing) for s in r.summary.values()], [3, 3])
+        with self.assertRaises(DropGuardError) as caught:  # 4 + 3 = 7 of 30
+            merge(existing, _kept(musicians, 4) + _kept(youtubers, 3), TODAY)
+        self.assertEqual((caught.exception.newly_missing, caught.exception.active), (7, 30))
+
+    def test_already_missing_channels_do_not_count(self):
+        active = _listed(30)
+        old = _listed(200, "UCold", "2026-01-01")
+        existing = {MUSICIAN: old, YOUTUBER: active}
+        # Not as drops: 200 still-missing lines plus 6 new drops stays allowed.
+        r = merge(existing, _kept(active, 6), TODAY)
+        self.assertEqual(len(r.summary[MUSICIAN].still_missing), 200)
+        self.assertEqual(len(r.summary[YOUTUBER].newly_missing), 6)
+        # Nor in the base: 7 is refused against the 30 active channels, where
+        # 20% of all 230 listed would have let 46 through.
+        with self.assertRaises(DropGuardError) as caught:
+            merge(existing, _kept(active, 7), TODAY)
+        self.assertEqual((caught.exception.active, caught.exception.limit), (30, 6))
+
+    def test_only_already_missing_channels_never_trips(self):
+        old = _listed(50, "UCold", "2026-01-01")
+        r = merge({YOUTUBER: old}, [ch("UCnew", "New")], TODAY)
+        self.assertEqual(len(r.summary[YOUTUBER].still_missing), 50)
+        self.assertEqual(r.contents[YOUTUBER][:50], old)
+
+    def test_first_run_never_trips(self):
+        subs = [ch(f"UCn{i:03d}", f"N{i}") for i in range(300)]
+        for existing in ({}, {MUSICIAN: [], YOUTUBER: []}, {YOUTUBER: ["# YouTubers", "", "a note"]}):
+            r = merge(existing, subs, TODAY)
+            self.assertEqual(sum(len(s.added) for s in r.summary.values()), 300)
+        self.assertIsNone(eys.check_drop(merge({}, [], TODAY).summary))
+
+    def test_restored_and_added_channels_do_not_offset_drops(self):
+        lines = _listed(30)
+        subs = _kept(lines, 7) + [ch(f"UCn{i}", f"New {i}") for i in range(50)]
+        with self.assertRaises(DropGuardError):
+            merge({YOUTUBER: lines}, subs, TODAY)
+
+    def test_restored_channels_are_not_in_the_base(self):
+        # 29 active + 1 that comes back: the base is 29 (limit 5), not 30 (limit 6).
+        active = _listed(29)
+        old = _listed(1, "UCold", "2026-01-01")
+        subs = _kept(active, 6) + [ch("UCold000", "N0")]
+        with self.assertRaises(DropGuardError) as caught:
+            merge({YOUTUBER: active + old}, subs, TODAY)
+        self.assertEqual((caught.exception.active, caught.exception.limit), (29, 5))
+
+    def test_duplicate_lines_count_once(self):
+        lines = _listed(30)
+        existing = {YOUTUBER: lines + lines[:6]}  # the 6 dropped ids each appear twice
+        r = merge(existing, _kept(lines, 6) + [ch("UCnew", "New")], TODAY)
+        self.assertEqual(len(r.summary[YOUTUBER].newly_missing), 6)
+
+    def test_refusal_leaves_the_input_untouched(self):
+        lines = _listed(30)
+        existing = {YOUTUBER: list(lines)}
+        with self.assertRaises(DropGuardError):
+            merge(existing, _kept(lines, 7), TODAY)
+        self.assertEqual(existing, {YOUTUBER: lines})
+
+    def test_check_drop_reports_without_raising(self):
+        r = self.drop(30, 7, allow_drop=True)
+        tripped = eys.check_drop(r.summary)
+        self.assertIsInstance(tripped, DropGuardError)
+        self.assertEqual((tripped.newly_missing, tripped.active, tripped.limit), (7, 30, 6))
+        self.assertIsNone(eys.check_drop(self.drop(30, 6).summary))
+
+
+class Issue5DropGuardCliTests(unittest.TestCase):
+    setUp, tearDown = CliTests.setUp, CliTests.tearDown
+    run_cli = CliTests.run_cli
+    snapshot = Issue4CliTests.snapshot
+
+    def seed(self, directory, musicians=10, youtubers=20):
+        """Write both files plus overrides.txt; return the channel lines."""
+        lines = {MUSICIAN: _listed(musicians, "UCm"), YOUTUBER: _listed(youtubers, "UCy")}
+        for cat, header in ((MUSICIAN, "# Musicians"), (YOUTUBER, "# YouTubers")):
+            with open(os.path.join(directory, eys.FILENAMES[cat]), "w", encoding="utf-8") as f:
+                f.write("\n".join([header, "", *lines[cat]]) + "\n")
+        with open(os.path.join(directory, "overrides.txt"), "w", encoding="utf-8") as f:
+            f.write("# none\n")
+        return lines
+
+    def subs(self, lines, dropped):
+        """Drop ``dropped`` youtubers; keep every musician."""
+        return lambda: _kept(lines[MUSICIAN], 0) + _kept(lines[YOUTUBER], dropped)
+
+    def stat_snapshot(self, directory):
+        out = {}
+        for name in sorted(os.listdir(directory)):
+            st = os.stat(os.path.join(directory, name))
+            out[name] = (st.st_mtime_ns, st.st_ino, st.st_size)
+        return out
+
+    def test_refusal_exits_2_and_touches_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.seed(d)
+            content, stats = self.snapshot(d), self.stat_snapshot(d)
+            code, out, err = self.run_cli("--output-dir", d, "--date", TODAY, fetch=self.subs(lines, 7))
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("7 of 30 listed channel(s) would be newly marked missing", err)
+            self.assertIn("drop threshold of 6 (the larger of 5 and 20%)", err)
+            self.assertIn("--allow-drop", err)
+            self.assertEqual(err.count("\n"), 1)
+            # Same bytes, same inodes, same mtimes, and no temp file left behind.
+            self.assertEqual(self.snapshot(d), content)
+            self.assertEqual(self.stat_snapshot(d), stats)
+
+    def test_refusal_never_calls_the_writer(self):
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.seed(d)
+            with mock.patch.object(eys, "atomic_write") as writer, mock.patch.object(eys.os, "makedirs") as mkdirs:
+                code, _, _ = self.run_cli("--output-dir", d, fetch=self.subs(lines, 30))
+            self.assertEqual(code, 2)
+            writer.assert_not_called()
+            mkdirs.assert_not_called()
+
+    def test_at_the_threshold_writes(self):
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.seed(d)
+            code, out, err = self.run_cli("--output-dir", d, "--date", TODAY, fetch=self.subs(lines, 6))
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("youtubers.md: 20 channels, +0 added, 6 newly missing", out)
+            self.assertNotIn("warning", out)
+            self.assertEqual(eys.read_text(os.path.join(d, "youtubers.md")).count(f"[missing since {TODAY}]"), 6)
+
+    def test_allow_drop_writes(self):
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.seed(d)
+            code, out, err = self.run_cli(
+                "--output-dir", d, "--allow-drop", "--date", TODAY, fetch=self.subs(lines, 7)
+            )
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("youtubers.md: 20 channels, +0 added, 7 newly missing", out)
+            self.assertNotIn("warning", out)
+            self.assertEqual(eys.read_text(os.path.join(d, "youtubers.md")).count(f"[missing since {TODAY}]"), 7)
+
+    def test_allow_empty_implies_allow_drop(self):
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.seed(d)
+            code, out, err = self.run_cli(
+                "--output-dir", d, "--allow-empty", "--date", TODAY, fetch=self.subs(lines, 7)
+            )
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("7 newly missing", out)
+            self.assertNotIn("warning", out)
+
+    def test_allow_drop_does_not_imply_allow_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.seed(d)
+            before = self.snapshot(d)
+            code, _, err = self.run_cli("--output-dir", d, "--allow-drop", fetch=lambda: [])
+            self.assertEqual(code, 2)
+            self.assertIn("--allow-empty", err)
+            self.assertEqual(self.snapshot(d), before)
+
+    def test_dry_run_reports_and_warns(self):
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.seed(d)
+            content, stats = self.snapshot(d), self.stat_snapshot(d)
+            code, out, err = self.run_cli(
+                "--output-dir", d, "--dry-run", "-v", "--date", TODAY, fetch=self.subs(lines, 7)
+            )
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("youtubers.md: 20 channels, +0 added, 7 newly missing", out)
+            self.assertIn(
+                "warning: 7 of 30 listed channel(s) would be newly marked missing, more than the drop "
+                "threshold of 6 (the larger of 5 and 20%); the API result may be partial; "
+                "a real run would refuse without --allow-drop\n",
+                out,
+            )
+            self.assertIn("dry run: no files written", out)
+            for line in lines[YOUTUBER][:7]:  # -v names what would be marked
+                self.assertIn(f"  youtubers.md newly missing: {parse_line(line).id}\n", out)
+            self.assertEqual(self.snapshot(d), content)
+            self.assertEqual(self.stat_snapshot(d), stats)
+
+    def test_dry_run_warns_only_when_a_real_run_would_refuse(self):
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.seed(d)
+            for argv, dropped in ((("--dry-run",), 6), (("--dry-run", "--allow-drop"), 7),
+                                  (("--dry-run", "--allow-empty"), 7)):
+                with self.subTest(argv=argv):
+                    code, out, _ = self.run_cli("--output-dir", d, *argv, fetch=self.subs(lines, dropped))
+                    self.assertEqual(code, 0)
+                    self.assertIn(f"{dropped} newly missing", out)
+                    self.assertNotIn("warning", out)
+
+    def test_dry_run_empty_list_still_refuses(self):
+        # The empty-list guard is unchanged: it exits 2 under --dry-run too.
+        with tempfile.TemporaryDirectory() as d:
+            self.seed(d)
+            code, out, err = self.run_cli("--output-dir", d, "--dry-run", fetch=lambda: [])
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("0 subscriptions", err)
+
+    def test_first_run_with_many_channels(self):
+        out_dir = os.path.join(self.sandbox, "fresh")
+        subs = [ch(f"UCn{i:03d}", f"N{i}") for i in range(120)]
+        code, out, err = self.run_cli("--output-dir", out_dir, fetch=lambda: subs)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("youtubers.md: 120 channels, +120 added, 0 newly missing", out)
+
+    def test_already_missing_do_not_count_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.seed(d)
+            self.run_cli("--output-dir", d, "--date", TODAY, fetch=self.subs(lines, 6))
+            # 6 are now marked: 24 active, floor 5. The same list again is a no-op...
+            before = self.snapshot(d)
+            code, out, _ = self.run_cli("--output-dir", d, "--date", LATER, fetch=self.subs(lines, 6))
+            self.assertEqual(code, 0)
+            self.assertIn("0 newly missing, 6 still missing", out)
+            self.assertEqual(self.snapshot(d), before)
+            # ...5 more go through, a 6th would not.
+            code, _, err = self.run_cli("--output-dir", d, "--date", LATER, fetch=self.subs(lines, 12))
+            self.assertEqual(code, 2)
+            self.assertIn("6 of 24 listed channel(s)", err)
+            self.assertEqual(self.snapshot(d), before)
+            code, out, _ = self.run_cli("--output-dir", d, "--date", LATER, fetch=self.subs(lines, 11))
+            self.assertEqual(code, 0)
+            self.assertIn("5 newly missing, 6 still missing", out)
+
+    def test_help_names_the_threshold(self):
+        text = " ".join(eys.build_parser().format_help().split())
+        self.assertIn("--allow-drop", text)
+        self.assertIn("max(5, 20%)", text)
+        self.assertIn("implies --allow-drop", text)
+
+    def test_readme_documents_allow_drop(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertIn("| `--allow-drop` |", readme)
+        floor, percent = eys.DROP_THRESHOLD
+        self.assertIn(f"max({floor}, {percent}%)", readme)
 
 
 if __name__ == "__main__":

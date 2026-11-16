@@ -19,7 +19,7 @@ import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence
 from urllib.parse import unquote
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
@@ -101,6 +101,44 @@ class MergeResult:
 
 class EmptySubscriptionsError(RuntimeError):
     """Raised when the API returned nothing but the files list channels."""
+
+
+class DropThreshold(NamedTuple):
+    """The drop guard's limit: the larger of ``floor`` channels and ``percent``
+    percent of the channels that were listed and not already marked missing."""
+
+    floor: int
+    percent: int
+
+    def limit(self, active: int) -> int:
+        """Most channels a run may newly mark missing out of ``active``.
+
+        Integer maths on purpose: for whole channel counts
+        ``n > active * percent / 100`` is the same as
+        ``n > active * percent // 100``, with no float rounding at the boundary.
+        """
+        return max(self.floor, active * self.percent // 100)
+
+
+# The one place to change the drop guard's default (issue #5). The floor keeps
+# small lists usable: unsubscribing from 5 of 8 channels is ordinary pruning,
+# while 20% of a long list going at once looks like a partial API result.
+DROP_THRESHOLD = DropThreshold(floor=5, percent=20)
+
+
+class DropGuardError(RuntimeError):
+    """Raised when a merge would newly mark too many channels missing."""
+
+    def __init__(self, newly_missing: int, active: int, limit: int):
+        self.newly_missing = newly_missing
+        self.active = active
+        self.limit = limit
+        super().__init__(
+            f"{newly_missing} of {active} listed channel(s) would be newly marked missing, "
+            f"more than the drop threshold of {limit} "
+            f"(the larger of {DROP_THRESHOLD.floor} and {DROP_THRESHOLD.percent}%); "
+            "the API result may be partial"
+        )
 
 
 class UsageError(Exception):
@@ -327,6 +365,24 @@ def count_channels(existing: Dict[str, List[str]]) -> int:
     return len({p.id for lines in existing.values() for p in map(parse_line, lines) if p})
 
 
+def check_drop(summary: Dict[str, FileSummary]) -> Optional[DropGuardError]:
+    """Return the drop-guard violation for a merge summary, or None.
+
+    ``active`` is every channel that was listed before this run and not already
+    marked missing, across both files. Channels that were already missing are
+    left out of both sides: they can't be dropped again, and counting them in
+    the base would loosen the guard on a file with a long tail of old markers.
+    A first run has no active channels and can't trip the guard.
+    """
+    newly_missing = sum(len(s.newly_missing) for s in summary.values())
+    # Restored channels carried a marker before this run, so they weren't active.
+    active = sum(s.total - len(s.added) - len(s.still_missing) - len(s.restored) for s in summary.values())
+    limit = DROP_THRESHOLD.limit(active)
+    if newly_missing > limit:
+        return DropGuardError(newly_missing, active, limit)
+    return None
+
+
 def merge(
     existing: Dict[str, List[str]],
     channels: Sequence[Channel],
@@ -334,6 +390,7 @@ def merge(
     overrides: Optional[Dict[str, str]] = None,
     allow_empty: bool = False,
     categorize: Optional[Callable[[Channel], str]] = None,
+    allow_drop: bool = False,
 ) -> MergeResult:
     """Merge the current subscription list into the existing file contents.
 
@@ -356,6 +413,9 @@ def merge(
         produces a warning (subscribed or missing alike); the line stays put.
       * A channel id on several lines (hand edits): every line is updated and
         a warning emitted; summary stats count only the first occurrence.
+      * Drop guard: raises DropGuardError when more than ``DROP_THRESHOLD``
+        channels would be newly marked missing (see ``check_drop``), unless
+        ``allow_drop`` or ``allow_empty`` is set.
     """
     overrides = overrides or {}
     if categorize is None:
@@ -440,6 +500,10 @@ def merge(
         s.renamed = list(dict.fromkeys(s.renamed))
         s.newly_missing = list(dict.fromkeys(s.newly_missing))
         s.still_missing = list(dict.fromkeys(s.still_missing))
+    if not (allow_drop or allow_empty):
+        tripped = check_drop(summary)
+        if tripped:
+            raise tripped
     return MergeResult(contents=contents, summary=summary, warnings=warnings)
 
 
@@ -943,7 +1007,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--allow-empty",
         action="store_true",
-        help="allow an empty subscription list to mark every listed channel missing",
+        help="allow an empty subscription list to mark every listed channel missing (implies --allow-drop)",
+    )
+    p.add_argument(
+        "--allow-drop",
+        action="store_true",
+        help=f"allow more than max({DROP_THRESHOLD.floor}, {DROP_THRESHOLD.percent}%%) of the listed channels "
+        "to be newly marked missing in one run",
     )
     p.add_argument(
         "--from-json",
@@ -1025,10 +1095,20 @@ def main(
             overrides,
             allow_empty=args.allow_empty,
             categorize=make_categorizer(overrides),
+            # A dry run writes nothing, so it reports the full result and warns
+            # below instead of refusing.
+            allow_drop=args.allow_drop or args.dry_run,
         )
     except EmptySubscriptionsError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    except DropGuardError as e:  # raised before anything is created or written
+        print(f"error: {e}; refusing to write (pass --allow-drop if this is real)", file=sys.stderr)
+        return 2
+    if args.dry_run and not (args.allow_drop or args.allow_empty):
+        tripped = check_drop(result.summary)
+        if tripped:
+            result.warnings.append(f"{tripped}; a real run would refuse without --allow-drop")
 
     created_dir = False
     if not args.dry_run:
