@@ -53,7 +53,8 @@ On the first run, a browser opens for Google sign-in. Use `--no-browser` on a he
 | `--dry-run` | off | Compute and print the summary without writing anything |
 | `--allow-empty` | off | Accept an empty subscription list (see Safety). Implies `--allow-drop` |
 | `--allow-drop` | off | Let one run newly mark more than max(5, 20%) of the listed channels missing (see the drop guard under Exit codes) |
-| `-v, --verbose` | off | List the channel IDs added, missing, restored or renamed |
+| `--apply-overrides` | off | Move channels that are already listed in the wrong file to the file `overrides.txt` names for them (see [Overrides](#overrides)). Without it, the run only warns |
+| `-v, --verbose` | off | List the channel IDs added, missing, restored, renamed or moved |
 | `--from-json PATH` | none | Read subscriptions from a JSON fixture instead of the API (for testing) |
 | `--date YYYY-MM-DD` | today | Date to use in new markers (for testing) |
 
@@ -133,7 +134,7 @@ The output directory is created with `mkdir -p` after the subscriptions are fetc
   - a `- ` list bullet
   - a name with no `#` before it
 - Every other line is kept exactly as written: headers, blank lines, notes. New files start with a `# Musicians` or `# YouTubers` header.
-- A channel already in **either** file stays in that file, on the same line. Lines are never reordered and never moved between files. To reclassify a channel, cut its line and paste it into the other file. The tool keeps it wherever you put it.
+- A channel already in **either** file stays in that file, on the same line. Lines are never reordered and never moved between files, unless you ask for it with `--apply-overrides` (see [Overrides](#overrides)). To reclassify a channel, cut its line and paste it into the other file. The tool keeps it wherever you put it.
 - New channels are added to the end of the file their category points to. They come in the order the API returns them, which is alphabetical.
 - **Channels you still follow:** the name is updated from the API, so renames show up. If the line had a missing marker, the marker is removed.
 - **Channels you no longer follow:** the stored name is kept and ` [missing since <first-seen-missing date>]` is added. Later runs keep the original date and never add a second marker.
@@ -166,7 +167,30 @@ UCxxxxxxxxxxxxxxxxxxxxxx musician   # band without topic tags
 UCyyyyyyyyyyyyyyyyyyyyyy youtuber   # music-theory teacher
 ```
 
-An override wins over the heuristics when the tool **places a new** channel. It never moves a channel that is already in a file, because positions are fixed. If an override disagrees with where a channel currently is, the run prints a warning telling you to move the line by hand. A malformed line makes the run stop with exit code 2, so typos don't go unnoticed.
+An override wins over the heuristics when the tool **places a new** channel. It never moves a channel that is already in a file, because positions are fixed. If an override disagrees with where a channel currently is, the run prints a warning telling you to move the line by hand or pass `--apply-overrides`. A malformed line makes the run stop with exit code 2, so typos don't go unnoticed.
+
+#### Moving existing lines: `--apply-overrides`
+
+Pass `--apply-overrides` to have the tool do that move for you. It is opt-in and applies to that run only:
+
+```sh
+./export-youtube-subscriptions --apply-overrides --dry-run   # preview
+./export-youtube-subscriptions --apply-overrides
+```
+
+- A channel whose override names the other file is taken out of the file it is in and appended to the **end** of the other one, after any channels added in the same run. If the target file doesn't exist yet, it is created with its header.
+- The line moves as the run would have written it in place. A channel you no longer follow keeps its stored name and its `[missing since …]` marker with the original date. A channel you still follow gets its name refreshed, as on any run.
+- Every other line in both files is left as it is. The gap the line leaves is closed; blank lines and notes around it stay.
+- **Idempotent:** after the move the override and the file agree, so a second run with the flag changes nothing.
+- With the flag, each summary line ends with `N moved in`: the number of channels moved **into** that file. A moved channel is counted in the file it moves to, in `channels` and in every other figure. `--dry-run` reports the same numbers and writes nothing. `-v` lists the IDs.
+
+  ```
+  musicians.md: 4 channels, +0 added, 0 newly missing, 0 still missing, 0 restored, 0 renamed, 0 moved in
+  youtubers.md: 4 channels, +0 added, 0 newly missing, 1 still missing, 0 restored, 0 renamed, 1 moved in
+  ```
+- A move is not a drop. The drop guard and the empty-list guard count a moved channel once, exactly as if it had stayed where it was.
+- If the same ID is on several lines (hand edits), every line that sits in the wrong file moves and none is deleted. The duplicate warning still prints.
+- The two files are replaced one after the other, not as a pair. The file that gains lines is written first, so if the second write fails the moved channel is in both files (the next run warns about the duplicate) and not in neither. Only when channels move in both directions in one run can a failed second write leave lines in neither file; the error then names those channel IDs.
 
 ## Safety
 

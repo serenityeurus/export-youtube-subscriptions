@@ -79,6 +79,9 @@ class FileSummary:
     still_missing: List[str] = field(default_factory=list)
     restored: List[str] = field(default_factory=list)
     renamed: List[str] = field(default_factory=list)
+    # Channels moved *into* this file by --apply-overrides. A moved channel is
+    # counted here (total and every other list) and no longer in its old file.
+    moved: List[str] = field(default_factory=list)
     total: int = 0
 
     def counts(self) -> Dict[str, int]:
@@ -89,6 +92,7 @@ class FileSummary:
             "still_missing": len(self.still_missing),
             "restored": len(self.restored),
             "renamed": len(self.renamed),
+            "moved": len(self.moved),
         }
 
 
@@ -373,6 +377,10 @@ def check_drop(summary: Dict[str, FileSummary]) -> Optional[DropGuardError]:
     left out of both sides: they can't be dropped again, and counting them in
     the base would loosen the guard on a file with a long tail of old markers.
     A first run has no active channels and can't trip the guard.
+
+    A channel moved by ``--apply-overrides`` is counted once, in the file it
+    moves to, with the same status it would have had in place: it stays in
+    ``active`` and is never a drop just because it left its old file.
     """
     newly_missing = sum(len(s.newly_missing) for s in summary.values())
     # Restored channels carried a marker before this run, so they weren't active.
@@ -391,6 +399,7 @@ def merge(
     allow_empty: bool = False,
     categorize: Optional[Callable[[Channel], str]] = None,
     allow_drop: bool = False,
+    apply_overrides: bool = False,
 ) -> MergeResult:
     """Merge the current subscription list into the existing file contents.
 
@@ -411,6 +420,14 @@ def merge(
         file.
       * An override that disagrees with the file a channel is already in only
         produces a warning (subscribed or missing alike); the line stays put.
+      * With ``apply_overrides`` that line is moved instead: taken out of its
+        file and appended to the end of the override's file, after any new
+        channels, in the order the lines were read. It is rendered exactly as
+        it would have been in place (stored name and missing marker kept for
+        an absent channel, name refreshed for a subscribed one), so a second
+        run finds nothing to move. All its stats, plus ``moved``, are counted
+        in the file it moves to. Every line of a duplicated id that sits in
+        the wrong file moves; no line is ever deleted.
       * A channel id on several lines (hand edits): every line is updated and
         a warning emitted; summary stats count only the first occurrence.
       * Drop guard: raises DropGuardError when more than ``DROP_THRESHOLD``
@@ -436,23 +453,29 @@ def merge(
     summary = {cat: FileSummary() for cat in CATEGORIES}
     contents: Dict[str, List[str]] = {}
     seen: Dict[str, str] = {}  # channel id -> category where first seen
+    moved_lines: Dict[str, List[str]] = {cat: [] for cat in CATEGORIES}
 
     for cat in CATEGORIES:
         out: List[str] = []
-        s = summary[cat]
         for line in existing.get(cat, []):
             p = parse_line(line)
             if p is None:
                 out.append(line)
                 continue
+            want = overrides.get(p.id)
+            misplaced = want in CATEGORIES and want != cat
+            # The file this line ends up in: where it is, unless it is moved.
+            home = want if misplaced and apply_overrides else cat
+            s = summary[home]
             first = p.id not in seen
             if first:
-                seen[p.id] = cat
+                seen[p.id] = home
                 s.total += 1
             else:
                 warnings.append(
                     f"duplicate channel {p.id} in {FILENAMES[cat]} "
-                    f"(also in {FILENAMES[seen[p.id]]}); left in place"
+                    f"(also in {FILENAMES[seen[p.id]]}); "
+                    + ("left in place" if home == cat else f"moved to {FILENAMES[home]}")
                 )
             # Duplicates are still rewritten, but stats come from the first line
             # only so per-file totals and deltas stay consistent.
@@ -464,19 +487,28 @@ def merge(
                     stats.restored.append(p.id)
                 if p.name and name != p.name:
                     stats.renamed.append(p.id)
-                out.append(format_line(p.id, name))
+                rendered = format_line(p.id, name)
             else:
                 since = p.missing_since or today
                 (stats.still_missing if p.missing_since else stats.newly_missing).append(p.id)
-                out.append(format_line(p.id, p.name, since))
-            # Positions are fixed, so an override can't move a line that already
-            # exists; tell the user where to paste it instead. Checked for
-            # missing channels too: the placement is wrong either way.
-            want = overrides.get(p.id)
-            if want and want != cat:
+                rendered = format_line(p.id, p.name, since)
+            if home != cat:
+                # --apply-overrides: leave this file, join the end of the other.
+                # Counted even for a duplicate line (unlike the stats above):
+                # the file really does gain it.
+                moved_lines[home].append(rendered)
+                s.moved.append(p.id)
+                continue
+            out.append(rendered)
+            # Without --apply-overrides positions are fixed, so an override
+            # can't move a line that already exists; tell the user where to
+            # paste it instead. Checked for missing channels too: the placement
+            # is wrong either way.
+            if misplaced:
                 warnings.append(
                     f"override says {p.id} is a {want} but it is listed in {FILENAMES[cat]}; "
-                    f"existing lines are never moved, move it by hand into {FILENAMES[want]}"
+                    f"existing lines are never moved, move it by hand into {FILENAMES[want]} "
+                    "(or pass --apply-overrides)"
                 )
         contents[cat] = out
 
@@ -494,8 +526,17 @@ def merge(
         summary[cat].total += 1
         seen[ch.id] = cat
 
+    # Moved lines go last, so they land at the very end of the target file.
+    for cat, lines_in in moved_lines.items():
+        if not lines_in:
+            continue
+        if not contents[cat]:
+            contents[cat].extend([HEADERS[cat], ""])  # target file didn't exist yet
+        contents[cat].extend(lines_in)
+
     # A duplicated id (hand edit) must only be counted once per file.
     for s in summary.values():
+        s.moved = list(dict.fromkeys(s.moved))
         s.restored = list(dict.fromkeys(s.restored))
         s.renamed = list(dict.fromkeys(s.renamed))
         s.newly_missing = list(dict.fromkeys(s.newly_missing))
@@ -958,7 +999,10 @@ def resolve_settings(args, environ=None, script_dir: Optional[str] = None) -> Se
 # --------------------------------------------------------------------------
 
 
-def format_summary(result: MergeResult, dry_run: bool) -> str:
+def format_summary(result: MergeResult, dry_run: bool, show_moved: bool = False) -> str:
+    """Per-file summary lines, then warnings. ``show_moved`` (--apply-overrides)
+    adds the ``moved in`` count; without the flag nothing can move, and the
+    lines stay exactly as they were before the flag existed."""
     out = []
     for cat in CATEGORIES:
         s = result.summary[cat]
@@ -966,6 +1010,7 @@ def format_summary(result: MergeResult, dry_run: bool) -> str:
             f"{FILENAMES[cat]}: {s.total} channels, +{len(s.added)} added, "
             f"{len(s.newly_missing)} newly missing, {len(s.still_missing)} still missing, "
             f"{len(s.restored)} restored, {len(s.renamed)} renamed"
+            + (f", {len(s.moved)} moved in" if show_moved else "")
         )
     for w in result.warnings:
         out.append(f"warning: {w}")
@@ -1014,6 +1059,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"allow more than max({DROP_THRESHOLD.floor}, {DROP_THRESHOLD.percent}%%) of the listed channels "
         "to be newly marked missing in one run",
+    )
+    p.add_argument(
+        "--apply-overrides",
+        action="store_true",
+        help=f"move channels already listed in the wrong file to the end of the file {OVERRIDES_FILENAME} "
+        "names for them (default: only warn)",
     )
     p.add_argument(
         "--from-json",
@@ -1098,6 +1149,7 @@ def main(
             # A dry run writes nothing, so it reports the full result and warns
             # below instead of refusing.
             allow_drop=args.allow_drop or args.dry_run,
+            apply_overrides=args.apply_overrides,
         )
     except EmptySubscriptionsError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -1121,17 +1173,31 @@ def main(
                 print(f"error: cannot create output dir {out_dir!r}: {e}", file=sys.stderr)
                 return 2
             created_dir = True
-        for cat in CATEGORIES:
+        # Each file is replaced atomically, but the pair is not. A file that
+        # gains moved lines (--apply-overrides) is written first, so a failure
+        # between the two writes leaves a moved channel in both files (a
+        # duplicate the next run reports) rather than in neither. Moves in both
+        # directions at once can't be ordered that way; see the except below.
+        write_order = sorted(CATEGORIES, key=lambda cat: not result.summary[cat].moved)
+        wrote_any = False
+        for cat in write_order:
             lines = result.contents[cat]
             path = os.path.join(out_dir, FILENAMES[cat])
             if not lines and not os.path.exists(path):
                 continue  # don't create empty files
             try:
-                atomic_write(path, join_lines(lines))
+                wrote_any = atomic_write(path, join_lines(lines)) or wrote_any
             except OSError as e:
-                # Each file is replaced atomically, but the pair is not: say
-                # which one failed so a half-applied run is easy to spot.
+                # Say which one failed so a half-applied run is easy to spot.
                 print(f"error: cannot write {path!r}: {e}", file=sys.stderr)
+                moved_in = result.summary[cat].moved
+                if wrote_any and moved_in:
+                    # The other file was already rewritten without these lines.
+                    print(
+                        f"error: not moved into {path!r}, re-add by hand if now in neither file: "
+                        + ", ".join(moved_in),
+                        file=sys.stderr,
+                    )
                 return 2
 
     print(f"env file: {settings.env_file or 'none'}")
@@ -1142,7 +1208,7 @@ def main(
         note = ", does not exist yet; would be created"
     print(f"output dir: {os.path.abspath(out_dir)} (from {settings.sources['output-dir']}{note})")
     print(f"fetched {len(channels)} subscriptions")
-    print(format_summary(result, args.dry_run))
+    print(format_summary(result, args.dry_run, show_moved=args.apply_overrides))
     if args.verbose:
         print(f"  client secrets: {settings.client_secrets} (from {settings.sources['client-secrets']})")
         print(f"  token: {settings.token_path} (from {settings.sources['token']})")
@@ -1153,6 +1219,7 @@ def main(
                 ("newly missing", s.newly_missing),
                 ("restored", s.restored),
                 ("renamed", s.renamed),
+                ("moved in", s.moved),
             ):
                 for cid in ids:
                     print(f"  {FILENAMES[cat]} {label}: {cid}")
