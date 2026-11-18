@@ -36,13 +36,13 @@ LATER = "2026-12-01"
 
 
 def _read_bytes(path):
-    with open(path, "rb") as f:
-        return f.read()
+    with open(path, "rb") as handle:
+        return handle.read()
 
 
 def _write_bytes(path, data):
-    with open(path, "wb") as f:
-        f.write(data)
+    with open(path, "wb") as handle:
+        handle.write(data)
 
 
 def ch(cid, title, topic_ids=(), cats=()):
@@ -51,12 +51,12 @@ def ch(cid, title, topic_ids=(), cats=()):
 
 class ParseLineTests(unittest.TestCase):
     def test_canonical(self):
-        p = parse_line(f"{URL}UCabc_-1 # Some Name")
-        self.assertEqual((p.id, p.name, p.missing_since), ("UCabc_-1", "Some Name", None))
+        parsed = parse_line(f"{URL}UCabc_-1 # Some Name")
+        self.assertEqual((parsed.id, parsed.name, parsed.missing_since), ("UCabc_-1", "Some Name", None))
 
     def test_marker(self):
-        p = parse_line(f"{URL}UCa # Old Name [missing since 2026-01-02]")
-        self.assertEqual((p.name, p.missing_since), ("Old Name", "2026-01-02"))
+        parsed = parse_line(f"{URL}UCa # Old Name [missing since 2026-01-02]")
+        self.assertEqual((parsed.name, parsed.missing_since), ("Old Name", "2026-01-02"))
 
     def test_name_with_hash(self):
         self.assertEqual(parse_line(f"{URL}UCa # C# Tutorials #1").name, "C# Tutorials #1")
@@ -69,9 +69,9 @@ class ParseLineTests(unittest.TestCase):
             f"{URL}UCa N",
             f"  {URL}UCa#N  ",
         ):
-            p = parse_line(line)
-            self.assertIsNotNone(p, line)
-            self.assertEqual((p.id, p.name), ("UCa", "N"), line)
+            parsed = parse_line(line)
+            self.assertIsNotNone(parsed, line)
+            self.assertEqual((parsed.id, parsed.name), ("UCa", "N"), line)
 
     def test_no_comment(self):
         self.assertEqual(parse_line(f"{URL}UCa").name, "")
@@ -84,8 +84,8 @@ class ParseLineTests(unittest.TestCase):
     def test_format_roundtrip_and_newline_safety(self):
         line = format_line("UCa", "Multi\nline\tname  ", "2026-01-01")
         self.assertEqual(line, f"{URL}UCa # Multi line name [missing since 2026-01-01]")
-        p = parse_line(line)
-        self.assertEqual((p.name, p.missing_since), ("Multi line name", "2026-01-01"))
+        parsed = parse_line(line)
+        self.assertEqual((parsed.name, parsed.missing_since), ("Multi line name", "2026-01-01"))
 
     def test_split_lines(self):
         self.assertEqual(eys.split_lines(""), [])
@@ -138,89 +138,89 @@ class OverridesTests(unittest.TestCase):
             parse_overrides("UCa\n")
 
     def test_override_wins_for_new_channel(self):
-        r = merge({}, [ch("UCa", "X - Topic")], TODAY, {"UCa": YOUTUBER})
-        self.assertIn(f"{URL}UCa # X - Topic", r.contents[YOUTUBER])
-        self.assertEqual(r.contents[MUSICIAN], [])
+        result = merge({}, [ch("UCa", "X - Topic")], TODAY, {"UCa": YOUTUBER})
+        self.assertIn(f"{URL}UCa # X - Topic", result.contents[YOUTUBER])
+        self.assertEqual(result.contents[MUSICIAN], [])
 
     def test_override_never_moves_existing(self):
         existing = {YOUTUBER: [f"{URL}UCa # Band"]}
-        r = merge(existing, [ch("UCa", "Band")], TODAY, {"UCa": MUSICIAN})
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # Band"])
-        self.assertEqual(r.contents[MUSICIAN], [])
-        self.assertTrue(any("move it by hand" in w for w in r.warnings))
+        result = merge(existing, [ch("UCa", "Band")], TODAY, {"UCa": MUSICIAN})
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # Band"])
+        self.assertEqual(result.contents[MUSICIAN], [])
+        self.assertTrue(any("move it by hand" in warning for warning in result.warnings))
 
 
 class MergeTests(unittest.TestCase):
     def test_first_run_creates_headers_and_order(self):
         subs = [ch("UCm", "Artist - Topic"), ch("UCy1", "Vlog"), ch("UCy2", "Tech")]
-        r = merge({}, subs, TODAY)
-        self.assertEqual(r.contents[MUSICIAN], ["# Musicians", "", f"{URL}UCm # Artist - Topic"])
+        result = merge({}, subs, TODAY)
+        self.assertEqual(result.contents[MUSICIAN], ["# Musicians", "", f"{URL}UCm # Artist - Topic"])
         self.assertEqual(
-            r.contents[YOUTUBER], ["# YouTubers", "", f"{URL}UCy1 # Vlog", f"{URL}UCy2 # Tech"]
+            result.contents[YOUTUBER], ["# YouTubers", "", f"{URL}UCy1 # Vlog", f"{URL}UCy2 # Tech"]
         )
-        self.assertEqual(r.summary[YOUTUBER].added, ["UCy1", "UCy2"])
+        self.assertEqual(result.summary[YOUTUBER].added, ["UCy1", "UCy2"])
 
     def test_append_new_preserves_positions_and_other_lines(self):
         existing = {YOUTUBER: ["My list", f"{URL}UCb # B", "", "<!-- note -->", f"{URL}UCa # A"]}
-        r = merge(existing, [ch("UCa", "A"), ch("UCb", "B"), ch("UCc", "C")], TODAY)
+        result = merge(existing, [ch("UCa", "A"), ch("UCb", "B"), ch("UCc", "C")], TODAY)
         self.assertEqual(
-            r.contents[YOUTUBER],
+            result.contents[YOUTUBER],
             ["My list", f"{URL}UCb # B", "", "<!-- note -->", f"{URL}UCa # A", f"{URL}UCc # C"],
         )
 
     def test_existing_file_without_header_gets_no_header(self):
-        r = merge({YOUTUBER: [f"{URL}UCa # A"]}, [ch("UCa", "A"), ch("UCb", "B")], TODAY)
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # A", f"{URL}UCb # B"])
+        result = merge({YOUTUBER: [f"{URL}UCa # A"]}, [ch("UCa", "A"), ch("UCb", "B")], TODAY)
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # A", f"{URL}UCb # B"])
 
     def test_missing_marker_keeps_stored_name(self):
         existing = {YOUTUBER: [f"{URL}UCa # Old", f"{URL}UCb # B"]}
-        r = merge(existing, [ch("UCb", "B")], TODAY)
-        self.assertEqual(r.contents[YOUTUBER][0], f"{URL}UCa # Old [missing since {TODAY}]")
-        self.assertEqual(r.summary[YOUTUBER].newly_missing, ["UCa"])
+        result = merge(existing, [ch("UCb", "B")], TODAY)
+        self.assertEqual(result.contents[YOUTUBER][0], f"{URL}UCa # Old [missing since {TODAY}]")
+        self.assertEqual(result.summary[YOUTUBER].newly_missing, ["UCa"])
 
     def test_marker_not_stacked_and_original_date_kept(self):
         existing = {YOUTUBER: [f"{URL}UCa # Old [missing since 2026-01-01]", f"{URL}UCb # B"]}
-        r = merge(existing, [ch("UCb", "B")], LATER)
-        self.assertEqual(r.contents[YOUTUBER][0], f"{URL}UCa # Old [missing since 2026-01-01]")
-        self.assertEqual(r.summary[YOUTUBER].still_missing, ["UCa"])
-        self.assertEqual(r.summary[YOUTUBER].newly_missing, [])
+        result = merge(existing, [ch("UCb", "B")], LATER)
+        self.assertEqual(result.contents[YOUTUBER][0], f"{URL}UCa # Old [missing since 2026-01-01]")
+        self.assertEqual(result.summary[YOUTUBER].still_missing, ["UCa"])
+        self.assertEqual(result.summary[YOUTUBER].newly_missing, [])
 
     def test_restore_removes_marker_and_refreshes_name(self):
         existing = {MUSICIAN: [f"{URL}UCa # Old [missing since 2026-01-01]"]}
-        r = merge(existing, [ch("UCa", "New Name")], LATER)
-        self.assertEqual(r.contents[MUSICIAN], [f"{URL}UCa # New Name"])
-        self.assertEqual(r.summary[MUSICIAN].restored, ["UCa"])
-        self.assertEqual(r.summary[MUSICIAN].renamed, ["UCa"])
+        result = merge(existing, [ch("UCa", "New Name")], LATER)
+        self.assertEqual(result.contents[MUSICIAN], [f"{URL}UCa # New Name"])
+        self.assertEqual(result.summary[MUSICIAN].restored, ["UCa"])
+        self.assertEqual(result.summary[MUSICIAN].renamed, ["UCa"])
 
     def test_present_name_refreshed_but_empty_api_title_keeps_stored(self):
         existing = {YOUTUBER: [f"{URL}UCa # Old", f"{URL}UCb # Keep"]}
-        r = merge(existing, [ch("UCa", "Renamed"), ch("UCb", "")], TODAY)
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # Renamed", f"{URL}UCb # Keep"])
+        result = merge(existing, [ch("UCa", "Renamed"), ch("UCb", "")], TODAY)
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # Renamed", f"{URL}UCb # Keep"])
 
     def test_no_moving_between_files(self):
         # Heuristic now says musician, but the channel lives in youtubers.md.
         existing = {YOUTUBER: [f"{URL}UCa # Band"]}
-        r = merge(existing, [ch("UCa", "Band - Topic")], TODAY)
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # Band - Topic"])
-        self.assertEqual(r.contents[MUSICIAN], [])
+        result = merge(existing, [ch("UCa", "Band - Topic")], TODAY)
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # Band - Topic"])
+        self.assertEqual(result.contents[MUSICIAN], [])
 
     def test_no_duplicates_and_dedupe_input(self):
         existing = {MUSICIAN: [f"{URL}UCa # A"]}
-        r = merge(existing, [ch("UCa", "A"), ch("UCa", "A"), ch("UCb", "B"), ch("UCb", "B")], TODAY)
-        all_lines = r.contents[MUSICIAN] + r.contents[YOUTUBER]
-        ids = [p.id for p in map(parse_line, all_lines) if p]
+        result = merge(existing, [ch("UCa", "A"), ch("UCa", "A"), ch("UCb", "B"), ch("UCb", "B")], TODAY)
+        all_lines = result.contents[MUSICIAN] + result.contents[YOUTUBER]
+        ids = [parsed.id for parsed in map(parse_line, all_lines) if parsed]
         self.assertEqual(sorted(ids), ["UCa", "UCb"])
 
     def test_preexisting_duplicates_left_and_warned(self):
         existing = {MUSICIAN: [f"{URL}UCa # A"], YOUTUBER: [f"{URL}UCa # A"]}
-        r = merge(existing, [ch("UCa", "A")], TODAY)
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # A"])
-        self.assertEqual(len(r.warnings), 1)
+        result = merge(existing, [ch("UCa", "A")], TODAY)
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # A"])
+        self.assertEqual(len(result.warnings), 1)
 
     def test_canonicalises_hand_edited_lines(self):
         existing = {YOUTUBER: ["- http://youtube.com/channel/UCa/ A"]}
-        r = merge(existing, [ch("UCa", "A")], TODAY)
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # A"])
+        result = merge(existing, [ch("UCa", "A")], TODAY)
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # A"])
 
     def test_idempotent(self):
         existing = {
@@ -231,51 +231,51 @@ class MergeTests(unittest.TestCase):
         r1 = merge(existing, subs, TODAY)
         r2 = merge(r1.contents, subs, LATER)
         self.assertEqual(r1.contents, r2.contents)
-        for s in r2.summary.values():
-            self.assertEqual((s.added, s.newly_missing, s.restored, s.renamed), ([], [], [], []))
+        for stats in r2.summary.values():
+            self.assertEqual((stats.added, stats.newly_missing, stats.restored, stats.renamed), ([], [], [], []))
 
     def test_empty_guard(self):
         existing = {YOUTUBER: [f"{URL}UCa # A"]}
         with self.assertRaises(EmptySubscriptionsError):
             merge(existing, [], TODAY)
-        r = merge(existing, [], TODAY, allow_empty=True)
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # A [missing since {TODAY}]"])
+        result = merge(existing, [], TODAY, allow_empty=True)
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # A [missing since {TODAY}]"])
 
     def test_empty_everything(self):
-        r = merge({}, [], TODAY)
-        self.assertEqual(r.contents, {MUSICIAN: [], YOUTUBER: []})
+        result = merge({}, [], TODAY)
+        self.assertEqual(result.contents, {MUSICIAN: [], YOUTUBER: []})
 
 
 class AtomicWriteTests(unittest.TestCase):
     def test_write_preserve_mode_and_no_temp_left(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "f.md")
-            self.assertTrue(eys.atomic_write(p, "a\n"))
-            os.chmod(p, 0o600)
-            self.assertTrue(eys.atomic_write(p, "b\n"))
-            self.assertEqual(eys.read_text(p), "b\n")
-            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
-            self.assertEqual(os.listdir(d), ["f.md"])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "f.md")
+            self.assertTrue(eys.atomic_write(path, "a\n"))
+            os.chmod(path, 0o600)
+            self.assertTrue(eys.atomic_write(path, "b\n"))
+            self.assertEqual(eys.read_text(path), "b\n")
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            self.assertEqual(os.listdir(tmp_dir), ["f.md"])
 
     def test_unchanged_is_not_rewritten(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "f.md")
-            eys.atomic_write(p, "a\n")
-            os.utime(p, (1, 1))
-            self.assertFalse(eys.atomic_write(p, "a\n"))
-            self.assertEqual(os.stat(p).st_mtime, 1)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "f.md")
+            eys.atomic_write(path, "a\n")
+            os.utime(path, (1, 1))
+            self.assertFalse(eys.atomic_write(path, "a\n"))
+            self.assertEqual(os.stat(path).st_mtime, 1)
 
     def test_failure_cleans_temp(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "f.md")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "f.md")
             orig = os.replace
-            os.replace = lambda *a: (_ for _ in ()).throw(OSError("boom"))
+            os.replace = lambda *args: (_ for _ in ()).throw(OSError("boom"))
             try:
                 with self.assertRaises(OSError):
-                    eys.atomic_write(p, "x")
+                    eys.atomic_write(path, "x")
             finally:
                 os.replace = orig
-            self.assertEqual(os.listdir(d), [])
+            self.assertEqual(os.listdir(tmp_dir), [])
 
     # write_files (issue #14): stage every file, then rename them in order.
 
@@ -414,8 +414,8 @@ class FetchTests(unittest.TestCase):
         chans = eys.fetch_channels(yt)
         self.assertEqual(len(chans), 123)
         self.assertEqual(len(yt.sub_calls), 3)
-        self.assertEqual([len(b) for b in yt.chan_calls], [50, 50, 23])
-        by_id = {c.id: c for c in chans}
+        self.assertEqual([len(batch) for batch in yt.chan_calls], [50, 50, 23])
+        by_id = {channel.id: channel for channel in chans}
         # channels.list title wins; missing channel item keeps subscription title.
         self.assertEqual(by_id[yt.ids[0]].title, f"Chan {yt.ids[0]}")
         self.assertEqual(by_id[yt.ids[7]].title, f"Sub {yt.ids[7]}")
@@ -453,48 +453,48 @@ class CliTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_end_to_end_from_json(self):
-        with tempfile.TemporaryDirectory() as d:
-            fx = os.path.join(d, "subs.json")
-            with open(fx, "w") as f:
-                json.dump([{"id": "UCm", "title": "A - Topic"}, {"id": "UCy", "title": "Vlog"}], f)
-            code, out, _ = self.run_cli("--output-dir", d, "--from-json", fx, "--date", TODAY)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fx = os.path.join(tmp_dir, "subs.json")
+            with open(fx, "w") as handle:
+                json.dump([{"id": "UCm", "title": "A - Topic"}, {"id": "UCy", "title": "Vlog"}], handle)
+            code, out, _ = self.run_cli("--output-dir", tmp_dir, "--from-json", fx, "--date", TODAY)
             self.assertEqual(code, 0)
             self.assertIn("musicians.md: 1 channels, +1 added", out)
-            with open(os.path.join(d, "musicians.md")) as f:
-                self.assertEqual(f.read(), f"# Musicians\n\n{URL}UCm # A - Topic\n")
+            with open(os.path.join(tmp_dir, "musicians.md")) as handle:
+                self.assertEqual(handle.read(), f"# Musicians\n\n{URL}UCm # A - Topic\n")
 
     def test_dry_run_writes_nothing(self):
-        with tempfile.TemporaryDirectory() as d:
-            code, out, _ = self.run_cli("--output-dir", d, "--dry-run", fetch=lambda: [ch("UCa", "A")])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            code, out, _ = self.run_cli("--output-dir", tmp_dir, "--dry-run", fetch=lambda: [ch("UCa", "A")])
             self.assertEqual(code, 0)
             self.assertIn("dry run", out)
-            self.assertEqual(os.listdir(d), [])
+            self.assertEqual(os.listdir(tmp_dir), [])
 
     def test_empty_guard_exit_code_and_files_untouched(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "youtubers.md")
-            with open(p, "w") as f:
-                f.write(f"{URL}UCa # A\n")
-            code, _, err = self.run_cli("--output-dir", d, fetch=lambda: [])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "youtubers.md")
+            with open(path, "w") as handle:
+                handle.write(f"{URL}UCa # A\n")
+            code, _, err = self.run_cli("--output-dir", tmp_dir, fetch=lambda: [])
             self.assertEqual(code, 2)
             self.assertIn("--allow-empty", err)
-            self.assertEqual(eys.read_text(p), f"{URL}UCa # A\n")
+            self.assertEqual(eys.read_text(path), f"{URL}UCa # A\n")
 
     def test_fetch_error_leaves_files(self):
         def boom():
             raise RuntimeError("quotaExceeded")
 
-        with tempfile.TemporaryDirectory() as d:
-            code, _, err = self.run_cli("--output-dir", d, fetch=boom)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            code, _, err = self.run_cli("--output-dir", tmp_dir, fetch=boom)
             self.assertEqual(code, 1)
             self.assertIn("quotaExceeded", err)
-            self.assertEqual(os.listdir(d), [])
+            self.assertEqual(os.listdir(tmp_dir), [])
 
     def test_bad_overrides(self):
-        with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "overrides.txt"), "w") as f:
-                f.write("UCa band\n")
-            code, _, err = self.run_cli("--output-dir", d, fetch=lambda: [])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with open(os.path.join(tmp_dir, "overrides.txt"), "w") as handle:
+                handle.write("UCa band\n")
+            code, _, err = self.run_cli("--output-dir", tmp_dir, fetch=lambda: [])
             self.assertEqual(code, 2)
             self.assertIn("overrides.txt:1", err)
 
@@ -502,8 +502,8 @@ class CliTests(unittest.TestCase):
 
     def write_env(self, path, text):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            f.write(text)
+        with open(path, "w") as handle:
+            handle.write(text)
         return path
 
     def test_output_dir_from_env_file_next_to_executable_and_created(self):
@@ -542,16 +542,16 @@ class CliTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(target, "youtubers.md")))
 
     def test_output_dir_is_a_file(self):
-        f = os.path.join(self.sandbox, "file")
-        open(f, "w").close()
-        code, _, err = self.run_cli("--output-dir", f, fetch=lambda: [ch("UCa", "A")])
+        file_path = os.path.join(self.sandbox, "file")
+        open(file_path, "w").close()
+        code, _, err = self.run_cli("--output-dir", file_path, fetch=lambda: [ch("UCa", "A")])
         self.assertEqual(code, 2)
         self.assertIn("not a directory", err)
 
     def test_no_env_file_falls_back_to_cwd(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as tmp_dir:
             old = os.getcwd()
-            os.chdir(d)
+            os.chdir(tmp_dir)
             try:
                 code, out, _ = self.run_cli("--dry-run", fetch=lambda: [ch("UCa", "A")])
             finally:
@@ -627,24 +627,24 @@ class EnvParseTests(unittest.TestCase):
         )
 
     def test_quotes(self):
-        v = self.parse('A="/a b/c"\nB=\'/lit $HOME ~\'\nC="~/q"  # trailing\nD=""\n')
-        self.assertEqual(v, {"A": "/a b/c", "B": "/lit $HOME ~", "C": "/home/jay/q", "D": ""})
+        values = self.parse('A="/a b/c"\nB=\'/lit $HOME ~\'\nC="~/q"  # trailing\nD=""\n')
+        self.assertEqual(values, {"A": "/a b/c", "B": "/lit $HOME ~", "C": "/home/jay/q", "D": ""})
 
     def test_home_expansion(self):
-        v = self.parse("A=~/notes/pages\nB=$HOME/x\nC=${HOME}/y\nD=~\nE=~other/z\nF=$HOMEX\n")
-        self.assertEqual(v["A"], "/home/jay/notes/pages")
-        self.assertEqual(v["B"], "/home/jay/x")
-        self.assertEqual(v["C"], "/home/jay/y")
-        self.assertEqual(v["D"], "/home/jay")
-        self.assertEqual(v["E"], "~other/z")  # ~user is not expanded
-        self.assertEqual(v["F"], "$HOMEX")  # only the HOME variable, word-bounded
+        values = self.parse("A=~/notes/pages\nB=$HOME/x\nC=${HOME}/y\nD=~\nE=~other/z\nF=$HOMEX\n")
+        self.assertEqual(values["A"], "/home/jay/notes/pages")
+        self.assertEqual(values["B"], "/home/jay/x")
+        self.assertEqual(values["C"], "/home/jay/y")
+        self.assertEqual(values["D"], "/home/jay")
+        self.assertEqual(values["E"], "~other/z")  # ~user is not expanded
+        self.assertEqual(values["F"], "$HOMEX")  # only the HOME variable, word-bounded
 
     def test_inline_comment_needs_whitespace(self):
         self.assertEqual(self.parse("A=a#b # comment\n"), {"A": "a#b"})
 
     def test_export_prefix_crlf_bom_last_wins(self):
-        v = self.parse("﻿export A=1\r\nA=2\r\nexport\tB=3")
-        self.assertEqual(v, {"A": "2", "B": "3"})
+        values = self.parse("﻿export A=1\r\nA=2\r\nexport\tB=3")
+        self.assertEqual(values, {"A": "2", "B": "3"})
 
     def test_equals_in_value(self):
         self.assertEqual(self.parse("A=x=y\n"), {"A": "x=y"})
@@ -666,16 +666,16 @@ class EnvLookupTests(unittest.TestCase):
         self.home = os.path.join(self.d, "home")
         self.script_dir = os.path.join(self.d, "bin")
         self.cfg = os.path.join(self.home, ".config", "export-youtube-subscriptions")
-        for p in (self.script_dir, self.cfg):
-            os.makedirs(p)
+        for directory in (self.script_dir, self.cfg):
+            os.makedirs(directory)
         self.env = {"HOME": self.home}
 
     def tearDown(self):
         self._d.cleanup()
 
     def touch(self, path, text="EYS_OUTPUT_DIR=/x\n"):
-        with open(path, "w") as f:
-            f.write(text)
+        with open(path, "w") as handle:
+            handle.write(text)
         return path
 
     def find(self, cli=None, env=None):
@@ -696,8 +696,8 @@ class EnvLookupTests(unittest.TestCase):
     def test_xdg_config_home(self):
         xdg = os.path.join(self.d, "xdg", "export-youtube-subscriptions")
         os.makedirs(xdg)
-        p = self.touch(os.path.join(xdg, eys.ENV_FILENAME))
-        self.assertEqual(self.find(env=dict(self.env, XDG_CONFIG_HOME=os.path.join(self.d, "xdg"))), p)
+        env_path = self.touch(os.path.join(xdg, eys.ENV_FILENAME))
+        self.assertEqual(self.find(env=dict(self.env, XDG_CONFIG_HOME=os.path.join(self.d, "xdg"))), env_path)
 
     def test_empty_env_var_is_unset(self):
         self.assertIsNone(self.find(env=dict(self.env, EYS_ENV_FILE="")))
@@ -709,8 +709,8 @@ class EnvLookupTests(unittest.TestCase):
             self.find(env=dict(self.env, EYS_ENV_FILE=os.path.join(self.d, "nope.env")))
 
     def test_explicit_tilde(self):
-        p = self.touch(os.path.join(self.home, "my.env"))
-        self.assertEqual(self.find(cli="~/my.env"), p)
+        env_path = self.touch(os.path.join(self.home, "my.env"))
+        self.assertEqual(self.find(cli="~/my.env"), env_path)
 
     def test_directory_named_like_env_file_is_skipped(self):
         os.makedirs(os.path.join(self.script_dir, eys.ENV_FILENAME))
@@ -727,15 +727,15 @@ class EnvLookupTests(unittest.TestCase):
         self.assertEqual(eys.find_env_file(None, self.env, resolved), os.path.realpath(envf))
 
     def test_relative_paths_anchored_to_env_file_dir(self):
-        p = self.touch(
+        env_path = self.touch(
             os.path.join(self.script_dir, eys.ENV_FILENAME),
             "EYS_OUTPUT_DIR=out\nEYS_CLIENT_SECRETS=./cs.json\nEYS_TOKEN_PATH=/abs/t.json\nOTHER=rel\n",
         )
-        v = eys.load_env_file(p, self.env)
-        self.assertEqual(v["EYS_OUTPUT_DIR"], os.path.join(self.script_dir, "out"))
-        self.assertEqual(v["EYS_CLIENT_SECRETS"], os.path.join(self.script_dir, "cs.json"))
-        self.assertEqual(v["EYS_TOKEN_PATH"], "/abs/t.json")
-        self.assertEqual(v["OTHER"], "rel")
+        values = eys.load_env_file(env_path, self.env)
+        self.assertEqual(values["EYS_OUTPUT_DIR"], os.path.join(self.script_dir, "out"))
+        self.assertEqual(values["EYS_CLIENT_SECRETS"], os.path.join(self.script_dir, "cs.json"))
+        self.assertEqual(values["EYS_TOKEN_PATH"], "/abs/t.json")
+        self.assertEqual(values["OTHER"], "rel")
 
 
 class SettingsPrecedenceTests(unittest.TestCase):
@@ -743,8 +743,8 @@ class SettingsPrecedenceTests(unittest.TestCase):
         self._d = tempfile.TemporaryDirectory()
         self.d = self._d.name
         self.env = {"HOME": os.path.join(self.d, "home")}
-        with open(os.path.join(self.d, eys.ENV_FILENAME), "w") as f:
-            f.write("EYS_OUTPUT_DIR=/file/out\nEYS_CLIENT_SECRETS=/file/cs.json\nEYS_TOKEN_PATH=/file/t.json\n")
+        with open(os.path.join(self.d, eys.ENV_FILENAME), "w") as handle:
+            handle.write("EYS_OUTPUT_DIR=/file/out\nEYS_CLIENT_SECRETS=/file/cs.json\nEYS_TOKEN_PATH=/file/t.json\n")
 
     def tearDown(self):
         self._d.cleanup()
@@ -755,24 +755,24 @@ class SettingsPrecedenceTests(unittest.TestCase):
                                     script_dir if script_dir is not None else self.d)
 
     def test_file_beats_default(self):
-        s = self.resolve()
-        self.assertEqual((s.output_dir, s.client_secrets, s.token_path),
+        settings = self.resolve()
+        self.assertEqual((settings.output_dir, settings.client_secrets, settings.token_path),
                          ("/file/out", "/file/cs.json", "/file/t.json"))
-        self.assertEqual(s.env_file, os.path.join(self.d, eys.ENV_FILENAME))
+        self.assertEqual(settings.env_file, os.path.join(self.d, eys.ENV_FILENAME))
 
     def test_env_beats_file(self):
         env = dict(self.env, EYS_OUTPUT_DIR="/env/out", EYS_TOKEN_PATH="~/t.json")
-        s = self.resolve(env=env)
-        self.assertEqual(s.output_dir, "/env/out")
-        self.assertEqual(s.token_path, os.path.join(self.env["HOME"], "t.json"))
-        self.assertEqual(s.client_secrets, "/file/cs.json")
-        self.assertEqual(s.sources["output-dir"], "$EYS_OUTPUT_DIR")
+        settings = self.resolve(env=env)
+        self.assertEqual(settings.output_dir, "/env/out")
+        self.assertEqual(settings.token_path, os.path.join(self.env["HOME"], "t.json"))
+        self.assertEqual(settings.client_secrets, "/file/cs.json")
+        self.assertEqual(settings.sources["output-dir"], "$EYS_OUTPUT_DIR")
 
     def test_flag_beats_env(self):
         env = dict(self.env, EYS_OUTPUT_DIR="/env/out")
-        s = self.resolve(["--output-dir", "/flag", "--client-secrets", "c.json", "--token", "t"], env=env)
-        self.assertEqual((s.output_dir, s.client_secrets, s.token_path), ("/flag", "c.json", "t"))
-        self.assertEqual(s.sources["output-dir"], "--output-dir")
+        settings = self.resolve(["--output-dir", "/flag", "--client-secrets", "c.json", "--token", "t"], env=env)
+        self.assertEqual((settings.output_dir, settings.client_secrets, settings.token_path), ("/flag", "c.json", "t"))
+        self.assertEqual(settings.sources["output-dir"], "--output-dir")
 
     def test_empty_values_are_unset(self):
         env = dict(self.env, EYS_OUTPUT_DIR="")
@@ -781,18 +781,18 @@ class SettingsPrecedenceTests(unittest.TestCase):
 
     def test_builtin_defaults_without_file(self):
         with tempfile.TemporaryDirectory() as empty:
-            s = self.resolve(script_dir=empty)
-        self.assertEqual(s.env_file, None)
-        self.assertEqual(s.output_dir, ".")
-        self.assertEqual(s.client_secrets, "client_secret.json")
+            settings = self.resolve(script_dir=empty)
+        self.assertEqual(settings.env_file, None)
+        self.assertEqual(settings.output_dir, ".")
+        self.assertEqual(settings.client_secrets, "client_secret.json")
         self.assertEqual(
-            s.token_path, os.path.join(self.env["HOME"], ".config", "export-youtube-subscriptions", "token.json")
+            settings.token_path, os.path.join(self.env["HOME"], ".config", "export-youtube-subscriptions", "token.json")
         )
-        self.assertEqual(set(s.sources.values()), {"default"})
+        self.assertEqual(set(settings.sources.values()), {"default"})
 
     def test_single_quoted_file_value_stays_literal(self):
-        with open(os.path.join(self.d, eys.ENV_FILENAME), "w") as f:
-            f.write("EYS_OUTPUT_DIR='/lit/~'\n")
+        with open(os.path.join(self.d, eys.ENV_FILENAME), "w") as handle:
+            handle.write("EYS_OUTPUT_DIR='/lit/~'\n")
         self.assertEqual(self.resolve().output_dir, "/lit/~")
 
 
@@ -803,51 +803,51 @@ class Issue2EdgeCaseTests(unittest.TestCase):
     def test_bom_on_first_channel_line_is_recognised(self):
         # A UTF-8 BOM (Windows editors) must not hide the first channel, or
         # the next run would append a duplicate of it.
-        p = parse_line(f"\ufeff{URL}UCa # A")
-        self.assertIsNotNone(p)
-        self.assertEqual((p.id, p.name), ("UCa", "A"))
-        r = merge({YOUTUBER: [f"\ufeff{URL}UCa # A"]}, [ch("UCa", "A")], TODAY)
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # A"])
-        self.assertEqual(r.summary[YOUTUBER].added, [])
+        parsed = parse_line(f"\ufeff{URL}UCa # A")
+        self.assertIsNotNone(parsed)
+        self.assertEqual((parsed.id, parsed.name), ("UCa", "A"))
+        result = merge({YOUTUBER: [f"\ufeff{URL}UCa # A"]}, [ch("UCa", "A")], TODAY)
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # A"])
+        self.assertEqual(result.summary[YOUTUBER].added, [])
 
     def test_scheme_and_host_case_insensitive(self):
-        p = parse_line("HTTPS://WWW.YouTube.com/channel/UCaBc # N")
-        self.assertIsNotNone(p)
-        self.assertEqual(p.id, "UCaBc")  # ids are case-sensitive: kept verbatim
+        parsed = parse_line("HTTPS://WWW.YouTube.com/channel/UCaBc # N")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.id, "UCaBc")  # ids are case-sensitive: kept verbatim
 
     def test_marker_on_hand_edited_variant(self):
-        p = parse_line("- http://m.youtube.com/channel/UCa/ Old [missing since 2026-01-02]")
-        self.assertEqual((p.id, p.name, p.missing_since), ("UCa", "Old", "2026-01-02"))
+        parsed = parse_line("- http://m.youtube.com/channel/UCa/ Old [missing since 2026-01-02]")
+        self.assertEqual((parsed.id, parsed.name, parsed.missing_since), ("UCa", "Old", "2026-01-02"))
 
     def test_empty_name_renders_without_dangling_separator(self):
         self.assertEqual(format_line("UCa", ""), f"{URL}UCa")
         self.assertEqual(format_line("UCa", "  ", TODAY), f"{URL}UCa [missing since {TODAY}]")
-        p = parse_line(format_line("UCa", "", TODAY))
-        self.assertEqual((p.id, p.name, p.missing_since), ("UCa", "", TODAY))
+        parsed = parse_line(format_line("UCa", "", TODAY))
+        self.assertEqual((parsed.id, parsed.name, parsed.missing_since), ("UCa", "", TODAY))
 
     def test_other_lines_verbatim_including_whitespace(self):
         odd = ["#  Musicians  ", "\t- note with tab", "   ", "https://www.youtube.com/@handle"]
-        r = merge({MUSICIAN: odd}, [ch("UCa", "A - Topic")], TODAY)
-        self.assertEqual(r.contents[MUSICIAN], odd + [f"{URL}UCa # A - Topic"])
+        result = merge({MUSICIAN: odd}, [ch("UCa", "A - Topic")], TODAY)
+        self.assertEqual(result.contents[MUSICIAN], odd + [f"{URL}UCa # A - Topic"])
 
     # --- category callback ----------------------------------------------
     def test_caller_supplied_category_callback(self):
         calls = []
 
-        def cat(c):
-            calls.append(c.id)
-            return MUSICIAN if c.id.endswith("m") else YOUTUBER
+        def cat(channel):
+            calls.append(channel.id)
+            return MUSICIAN if channel.id.endswith("m") else YOUTUBER
 
         existing = {YOUTUBER: [f"{URL}UCold # Old"]}
         subs = [ch("UCold", "Old"), ch("UC1m", "x"), ch("UC2", "y"), ch("UC3m", "z")]
-        r = merge(existing, subs, TODAY, categorize=cat)
+        result = merge(existing, subs, TODAY, categorize=cat)
         self.assertEqual(calls, ["UC1m", "UC2", "UC3m"])  # only new channels, input order
-        self.assertEqual(r.contents[MUSICIAN], ["# Musicians", "", f"{URL}UC1m # x", f"{URL}UC3m # z"])
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCold # Old", f"{URL}UC2 # y"])
+        self.assertEqual(result.contents[MUSICIAN], ["# Musicians", "", f"{URL}UC1m # x", f"{URL}UC3m # z"])
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCold # Old", f"{URL}UC2 # y"])
 
     def test_category_callback_bad_value_raises(self):
         with self.assertRaises(ValueError):
-            merge({}, [ch("UCa", "A")], TODAY, categorize=lambda c: "podcast")
+            merge({}, [ch("UCa", "A")], TODAY, categorize=lambda channel: "podcast")
 
     # --- duplicates -------------------------------------------------------
     def test_duplicate_ids_all_lines_updated_and_counted_once(self):
@@ -855,21 +855,21 @@ class Issue2EdgeCaseTests(unittest.TestCase):
             MUSICIAN: [f"{URL}UCa # Old", f"{URL}UCb # B"],
             YOUTUBER: [f"{URL}UCa # Old", "- http://youtube.com/channel/UCb/ B"],
         }
-        r = merge(existing, [ch("UCa", "New")], TODAY)
-        self.assertEqual(r.contents[MUSICIAN], [f"{URL}UCa # New", f"{URL}UCb # B [missing since {TODAY}]"])
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # New", f"{URL}UCb # B [missing since {TODAY}]"])
-        self.assertEqual(len(r.warnings), 2)
-        self.assertTrue(all("duplicate" in w for w in r.warnings))
+        result = merge(existing, [ch("UCa", "New")], TODAY)
+        self.assertEqual(result.contents[MUSICIAN], [f"{URL}UCa # New", f"{URL}UCb # B [missing since {TODAY}]"])
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # New", f"{URL}UCb # B [missing since {TODAY}]"])
+        self.assertEqual(len(result.warnings), 2)
+        self.assertTrue(all("duplicate" in warning for warning in result.warnings))
         # Stats belong to the first occurrence only, so totals and deltas agree.
-        m, y = r.summary[MUSICIAN], r.summary[YOUTUBER]
-        self.assertEqual((m.total, m.renamed, m.newly_missing), (2, ["UCa"], ["UCb"]))
-        self.assertEqual((y.total, y.renamed, y.newly_missing), (0, [], []))
+        musicians, youtubers = result.summary[MUSICIAN], result.summary[YOUTUBER]
+        self.assertEqual((musicians.total, musicians.renamed, musicians.newly_missing), (2, ["UCa"], ["UCb"]))
+        self.assertEqual((youtubers.total, youtubers.renamed, youtubers.newly_missing), (0, [], []))
 
     def test_duplicate_within_one_file_warns(self):
-        r = merge({YOUTUBER: [f"{URL}UCa # A", f"{URL}UCa # A"]}, [ch("UCa", "A")], TODAY)
-        self.assertEqual(r.contents[YOUTUBER], [f"{URL}UCa # A", f"{URL}UCa # A"])
-        self.assertEqual(len(r.warnings), 1)
-        self.assertEqual(r.summary[YOUTUBER].total, 1)
+        result = merge({YOUTUBER: [f"{URL}UCa # A", f"{URL}UCa # A"]}, [ch("UCa", "A")], TODAY)
+        self.assertEqual(result.contents[YOUTUBER], [f"{URL}UCa # A", f"{URL}UCa # A"])
+        self.assertEqual(len(result.warnings), 1)
+        self.assertEqual(result.summary[YOUTUBER].total, 1)
 
     # --- summary ---------------------------------------------------------
     def test_summary_counts_all_kinds(self):
@@ -883,15 +883,15 @@ class Issue2EdgeCaseTests(unittest.TestCase):
             ]
         }
         subs = [ch("UCkeep", "Keep"), ch("UCren", "After"), ch("UCback", "Back"), ch("UCnew", "New")]
-        s = merge(existing, subs, TODAY).summary[YOUTUBER]
-        self.assertEqual(s.total, 6)
-        self.assertEqual(s.added, ["UCnew"])
-        self.assertEqual(s.newly_missing, ["UCgone"])
-        self.assertEqual(s.still_missing, ["UCstill"])
-        self.assertEqual(s.restored, ["UCback"])
-        self.assertEqual(s.renamed, ["UCren"])
+        summary = merge(existing, subs, TODAY).summary[YOUTUBER]
+        self.assertEqual(summary.total, 6)
+        self.assertEqual(summary.added, ["UCnew"])
+        self.assertEqual(summary.newly_missing, ["UCgone"])
+        self.assertEqual(summary.still_missing, ["UCstill"])
+        self.assertEqual(summary.restored, ["UCback"])
+        self.assertEqual(summary.renamed, ["UCren"])
         self.assertEqual(
-            s.counts(),
+            summary.counts(),
             {
                 "channels": 6,
                 "added": 1,
@@ -905,43 +905,43 @@ class Issue2EdgeCaseTests(unittest.TestCase):
 
     # --- atomic write / idempotency on disk --------------------------------
     def test_write_through_symlink_keeps_link(self):
-        with tempfile.TemporaryDirectory() as d:
-            real = os.path.join(d, "real.md")
-            link = os.path.join(d, "youtubers.md")
-            with open(real, "w") as f:
-                f.write("old\n")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            real = os.path.join(tmp_dir, "real.md")
+            link = os.path.join(tmp_dir, "youtubers.md")
+            with open(real, "w") as handle:
+                handle.write("old\n")
             os.symlink(real, link)
             self.assertTrue(eys.atomic_write(link, "new\n"))
             self.assertTrue(os.path.islink(link))
             self.assertEqual(eys.read_text(real), "new\n")
-            self.assertEqual(sorted(os.listdir(d)), ["real.md", "youtubers.md"])
+            self.assertEqual(sorted(os.listdir(tmp_dir)), ["real.md", "youtubers.md"])
 
     def test_new_file_respects_umask(self):
         old = os.umask(0o077)
         try:
-            with tempfile.TemporaryDirectory() as d:
-                p = os.path.join(d, "f.md")
-                eys.atomic_write(p, "a\n")
-                self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                path = os.path.join(tmp_dir, "f.md")
+                eys.atomic_write(path, "a\n")
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         finally:
             os.umask(old)
 
     def test_cli_rerun_byte_identical_and_mtime_unchanged(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as tmp_dir:
             subs = lambda: [ch("UCm", "A - Topic"), ch("UCy", "Vlog")]  # noqa: E731
-            with open(os.path.join(d, "youtubers.md"), "w") as f:
-                f.write(f"# Mine\n\n{URL}UCgone # Gone\n")
+            with open(os.path.join(tmp_dir, "youtubers.md"), "w") as handle:
+                handle.write(f"# Mine\n\n{URL}UCgone # Gone\n")
             out = io.StringIO()
             with redirect_stdout(out):
-                self.assertEqual(eys.main(["--output-dir", d, "--date", TODAY], fetch=subs), 0)
-            paths = [os.path.join(d, n) for n in ("musicians.md", "youtubers.md")]
-            first = [_read_bytes(p) for p in paths]
-            for p in paths:
-                os.utime(p, (1, 1))
+                self.assertEqual(eys.main(["--output-dir", tmp_dir, "--date", TODAY], fetch=subs), 0)
+            paths = [os.path.join(tmp_dir, filename) for filename in ("musicians.md", "youtubers.md")]
+            first = [_read_bytes(path) for path in paths]
+            for path in paths:
+                os.utime(path, (1, 1))
             with redirect_stdout(out):
-                self.assertEqual(eys.main(["--output-dir", d, "--date", LATER], fetch=subs), 0)
-            self.assertEqual([_read_bytes(p) for p in paths], first)
-            self.assertEqual([os.stat(p).st_mtime for p in paths], [1, 1])
+                self.assertEqual(eys.main(["--output-dir", tmp_dir, "--date", LATER], fetch=subs), 0)
+            self.assertEqual([_read_bytes(path) for path in paths], first)
+            self.assertEqual([os.stat(path).st_mtime for path in paths], [1, 1])
             self.assertIn(f"[missing since {TODAY}]".encode(), first[1])
 
 
@@ -981,8 +981,8 @@ class Issue3ClassifyTableTests(unittest.TestCase):
     def test_readme_topic_lists_are_exact(self):
         self.assertEqual(eys.MUSIC_TOPIC_IDS, frozenset(MUSIC_TOPICS))
         self.assertEqual(eys.WEAK_TOPIC_IDS, frozenset(WEAK_TOPICS))
-        self.assertEqual(eys.MUSIC_WIKI_SLUGS, frozenset(s.lower() for s in MUSIC_TOPICS.values()))
-        self.assertEqual(eys.WEAK_WIKI_SLUGS, frozenset(s.lower() for s in WEAK_TOPICS.values()))
+        self.assertEqual(eys.MUSIC_WIKI_SLUGS, frozenset(topic.lower() for topic in MUSIC_TOPICS.values()))
+        self.assertEqual(eys.WEAK_WIKI_SLUGS, frozenset(topic.lower() for topic in WEAK_TOPICS.values()))
 
     def test_rule1_topic_suffix(self):
         self.check(
@@ -1137,20 +1137,20 @@ class Issue3OverridesParseTests(unittest.TestCase):
         self.assertIn("/notes/overrides.txt:1:", str(ctx.exception))
 
     def test_load_overrides(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(eys.load_overrides(d), {})  # no file is fine
-            path = os.path.join(d, "overrides.txt")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("UCa musician  # café band\n")
-            self.assertEqual(eys.load_overrides(d), {"UCa": MUSICIAN})
-            with open(path, "wb") as f:
-                f.write(b"UCa musician # \xff\xfe\n")  # not UTF-8
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.assertEqual(eys.load_overrides(tmp_dir), {})  # no file is fine
+            path = os.path.join(tmp_dir, "overrides.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("UCa musician  # café band\n")
+            self.assertEqual(eys.load_overrides(tmp_dir), {"UCa": MUSICIAN})
+            with open(path, "wb") as handle:
+                handle.write(b"UCa musician # \xff\xfe\n")  # not UTF-8
             with self.assertRaises(eys.OverridesError):
-                eys.load_overrides(d)
+                eys.load_overrides(tmp_dir)
             os.remove(path)
             os.mkdir(path)  # unreadable: a directory
             with self.assertRaises(eys.OverridesError) as ctx:
-                eys.load_overrides(d)
+                eys.load_overrides(tmp_dir)
             self.assertIn(path, str(ctx.exception))
 
 
@@ -1170,21 +1170,21 @@ class Issue3OverridesMergeTests(unittest.TestCase):
         for title, topic_ids, override, want in cases:
             with self.subTest(title=title, override=override):
                 overrides = {"UCa": override} if override else {}
-                r = merge({}, [ch("UCa", title, topic_ids)], TODAY, overrides)
+                result = merge({}, [ch("UCa", title, topic_ids)], TODAY, overrides)
                 other = YOUTUBER if want == MUSICIAN else MUSICIAN
-                self.assertEqual(r.contents[want][-1], f"{URL}UCa # {title}")
-                self.assertEqual(r.contents[other], [])
-                self.assertEqual(r.summary[want].added, ["UCa"])
-                self.assertEqual(r.warnings, [])
+                self.assertEqual(result.contents[want][-1], f"{URL}UCa # {title}")
+                self.assertEqual(result.contents[other], [])
+                self.assertEqual(result.summary[want].added, ["UCa"])
+                self.assertEqual(result.warnings, [])
 
     def test_categorizer_is_the_merge_callback(self):
         categorize = eys.make_categorizer({"UCo": YOUTUBER})
         self.assertEqual(categorize(ch("UCo", "X - Topic")), YOUTUBER)
         self.assertEqual(categorize(ch("UCn", "X - Topic")), MUSICIAN)
         self.assertEqual(categorize(ch("UCn", "Vlog")), YOUTUBER)
-        r = merge({}, [ch("UCo", "X - Topic"), ch("UCn", "Y - Topic")], TODAY, categorize=categorize)
-        self.assertEqual(r.contents[YOUTUBER], ["# YouTubers", "", f"{URL}UCo # X - Topic"])
-        self.assertEqual(r.contents[MUSICIAN], ["# Musicians", "", f"{URL}UCn # Y - Topic"])
+        result = merge({}, [ch("UCo", "X - Topic"), ch("UCn", "Y - Topic")], TODAY, categorize=categorize)
+        self.assertEqual(result.contents[YOUTUBER], ["# YouTubers", "", f"{URL}UCo # X - Topic"])
+        self.assertEqual(result.contents[MUSICIAN], ["# Musicians", "", f"{URL}UCn # Y - Topic"])
 
     def test_disagreement_warns_and_never_moves(self):
         cases = [
@@ -1201,21 +1201,21 @@ class Issue3OverridesMergeTests(unittest.TestCase):
                 line = format_line("UCa", "Band", "2026-01-01" if marked else None)
                 existing = {cat: ["# Mine", line], other: ["# Other"]}
                 subs = [ch("UCa", "Band"), ch("UCkeep", "Keep")] if subscribed else [ch("UCkeep", "Keep")]
-                r = merge(existing, subs, TODAY, {"UCa": override})
-                self.assertEqual(len(r.contents[cat]), 2 + (cat == YOUTUBER))
-                self.assertTrue(r.contents[cat][1].startswith(f"{URL}UCa # Band"))
-                self.assertFalse(any("UCa" in out_line for out_line in r.contents[other]))
-                hits = [w for w in r.warnings if "UCa" in w]
-                self.assertEqual(len(hits), 1, r.warnings)
+                result = merge(existing, subs, TODAY, {"UCa": override})
+                self.assertEqual(len(result.contents[cat]), 2 + (cat == YOUTUBER))
+                self.assertTrue(result.contents[cat][1].startswith(f"{URL}UCa # Band"))
+                self.assertFalse(any("UCa" in out_line for out_line in result.contents[other]))
+                hits = [warning for warning in result.warnings if "UCa" in warning]
+                self.assertEqual(len(hits), 1, result.warnings)
                 for needle in (override, eys.FILENAMES[cat], eys.FILENAMES[other], "by hand"):
                     self.assertIn(needle, hits[0])
 
     def test_agreeing_or_unrelated_override_is_silent(self):
         existing = {MUSICIAN: [f"{URL}UCa # Band"], YOUTUBER: [f"{URL}UCb # Vlog"]}
         subs = [ch("UCa", "Band"), ch("UCb", "Vlog")]
-        r = merge(existing, subs, TODAY, {"UCa": MUSICIAN, "UCb": YOUTUBER, "UCnowhere": MUSICIAN})
-        self.assertEqual(r.warnings, [])
-        self.assertEqual(r.contents, existing)
+        result = merge(existing, subs, TODAY, {"UCa": MUSICIAN, "UCb": YOUTUBER, "UCnowhere": MUSICIAN})
+        self.assertEqual(result.warnings, [])
+        self.assertEqual(result.contents, existing)
 
     def test_override_set_after_placement_is_stable_across_runs(self):
         subs = [ch("UCa", "Teacher", ["/m/04rlf"])]
@@ -1232,14 +1232,14 @@ class Issue3CliTests(unittest.TestCase):
     setUp, tearDown, run_cli = CliTests.setUp, CliTests.tearDown, CliTests.run_cli
 
     def write(self, directory, name, text):
-        with open(os.path.join(directory, name), "w", encoding="utf-8") as f:
-            f.write(text)
+        with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+            handle.write(text)
 
     def test_overrides_place_new_channels_end_to_end(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.write(d, "youtubers.md", f"# YouTubers\n\n{URL}UCold # Old - Topic\n")
-            fixture = os.path.join(d, "subs.json")
-            with open(fixture, "w", encoding="utf-8") as f:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.write(tmp_dir, "youtubers.md", f"# YouTubers\n\n{URL}UCold # Old - Topic\n")
+            fixture = os.path.join(tmp_dir, "subs.json")
+            with open(fixture, "w", encoding="utf-8") as handle:
                 json.dump(
                     [
                         {"id": "UCband", "title": "Band"},
@@ -1247,13 +1247,15 @@ class Issue3CliTests(unittest.TestCase):
                         {"id": "UCold", "title": "Old - Topic", "topicIds": None},
                         {"id": "UCjazz", "title": "Trio", "topicCategories": [WIKI + "Jazz", WIKI + "Entertainment"]},
                     ],
-                    f,
+                    handle,
                 )
-            self.write(d, "overrides.txt", "# mine\nUCband musician  # untagged\nUCteach youtuber\nUCold musician\n")
-            code, out, err = self.run_cli("--output-dir", d, "--from-json", fixture, "--date", TODAY)
+            self.write(
+                tmp_dir, "overrides.txt", "# mine\nUCband musician  # untagged\nUCteach youtuber\nUCold musician\n"
+            )
+            code, out, err = self.run_cli("--output-dir", tmp_dir, "--from-json", fixture, "--date", TODAY)
             self.assertEqual((code, err), (0, ""))
-            musicians = _read_bytes(os.path.join(d, "musicians.md")).decode()
-            youtubers = _read_bytes(os.path.join(d, "youtubers.md")).decode()
+            musicians = _read_bytes(os.path.join(tmp_dir, "musicians.md")).decode()
+            youtubers = _read_bytes(os.path.join(tmp_dir, "youtubers.md")).decode()
             self.assertEqual(musicians, f"# Musicians\n\n{URL}UCband # Band\n{URL}UCjazz # Trio\n")
             self.assertEqual(
                 youtubers, f"# YouTubers\n\n{URL}UCold # Old - Topic\n{URL}UCteach # Teacher\n"
@@ -1263,25 +1265,27 @@ class Issue3CliTests(unittest.TestCase):
 
     def test_bad_overrides_exit_2_before_fetch_and_touch_nothing(self):
         for text in ("UCa band\n", "UCa\n", "UCa musician\nUCa youtuber\n"):
-            with self.subTest(text=text), tempfile.TemporaryDirectory() as d:
-                self.write(d, "overrides.txt", text)
-                self.write(d, "youtubers.md", f"{URL}UCgone # Gone\n")
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as tmp_dir:
+                self.write(tmp_dir, "overrides.txt", text)
+                self.write(tmp_dir, "youtubers.md", f"{URL}UCgone # Gone\n")
                 fetched = []
-                code, out, err = self.run_cli("--output-dir", d, fetch=lambda: fetched.append(1) or [ch("UCn", "N")])  # noqa: B023
+                code, out, err = self.run_cli(
+                    "--output-dir", tmp_dir, fetch=lambda: fetched.append(1) or [ch("UCn", "N")]  # noqa: B023
+                )
                 self.assertEqual(code, 2)
                 self.assertEqual(fetched, [])  # no API quota spent on a config typo
-                self.assertIn(os.path.join(d, "overrides.txt") + ":", err)
+                self.assertIn(os.path.join(tmp_dir, "overrides.txt") + ":", err)
                 self.assertEqual(out, "")
-                self.assertEqual(sorted(os.listdir(d)), ["overrides.txt", "youtubers.md"])
-                self.assertEqual(_read_bytes(os.path.join(d, "youtubers.md")), f"{URL}UCgone # Gone\n".encode())
+                self.assertEqual(sorted(os.listdir(tmp_dir)), ["overrides.txt", "youtubers.md"])
+                self.assertEqual(_read_bytes(os.path.join(tmp_dir, "youtubers.md")), f"{URL}UCgone # Gone\n".encode())
 
     def test_unreadable_overrides_is_exit_2(self):
-        with tempfile.TemporaryDirectory() as d:
-            os.mkdir(os.path.join(d, "overrides.txt"))
-            code, _, err = self.run_cli("--output-dir", d, fetch=lambda: [ch("UCn", "N")])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.mkdir(os.path.join(tmp_dir, "overrides.txt"))
+            code, _, err = self.run_cli("--output-dir", tmp_dir, fetch=lambda: [ch("UCn", "N")])
             self.assertEqual(code, 2)
             self.assertIn("overrides.txt", err)
-            self.assertEqual(os.listdir(d), ["overrides.txt"])
+            self.assertEqual(os.listdir(tmp_dir), ["overrides.txt"])
 
 
 # --------------------------------------------------------------------------
@@ -1330,7 +1334,11 @@ class _Scripted:
 
 
 def sub_page(ids, next_token=None):
-    page = {"items": [{"snippet": {"title": f"Sub {i}", "resourceId": {"channelId": i}}} for i in ids]}
+    page = {
+        "items": [
+            {"snippet": {"title": f"Sub {channel_id}", "resourceId": {"channelId": channel_id}}} for channel_id in ids
+        ]
+    }
     if next_token:
         page["nextPageToken"] = next_token
     return page
@@ -1352,15 +1360,15 @@ class Issue4FetchTests(unittest.TestCase):
             with self.subTest(count=count):
                 yt = FakeYouTube(count)
                 chans = eys.fetch_channels(yt)
-                self.assertEqual([c.id for c in chans], yt.ids)  # API order kept across pages
+                self.assertEqual([channel.id for channel in chans], yt.ids)  # API order kept across pages
                 self.assertEqual(len(yt.sub_calls), pages)
-                self.assertEqual([len(b) for b in yt.chan_calls], batches)
+                self.assertEqual([len(batch) for batch in yt.chan_calls], batches)
 
     def test_duplicate_and_malformed_items_are_skipped(self):
         junk = [{"snippet": {"title": "no id"}}, {"snippet": None}, {}]
         pages = [sub_page(["UCa", "UCb"], "t1"), {"items": sub_page(["UCb", "UCc"])["items"] + junk}]
         yt = ScriptedYouTube(pages)
-        self.assertEqual([c.id for c in eys.fetch_channels(yt)], ["UCa", "UCb", "UCc"])
+        self.assertEqual([channel.id for channel in eys.fetch_channels(yt)], ["UCa", "UCb", "UCc"])
         self.assertEqual(yt.chan_calls[0]["id"], "UCa,UCb,UCc")
 
     def test_null_fields_are_tolerated(self):
@@ -1409,8 +1417,8 @@ class Issue4CliTests(unittest.TestCase):
 
     def write(self, directory, name, text):
         path = os.path.join(directory, name)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
         return path
 
     def fixture(self, data):
@@ -1426,7 +1434,7 @@ class Issue4CliTests(unittest.TestCase):
         yt = FakeYouTube(123)
         code, out, err = self.run_cli("--output-dir", out_dir, "--date", TODAY, youtube=yt)
         self.assertEqual((code, err), (0, ""))
-        self.assertEqual((len(yt.sub_calls), [len(b) for b in yt.chan_calls]), (3, [50, 50, 23]))
+        self.assertEqual((len(yt.sub_calls), [len(batch) for batch in yt.chan_calls]), (3, [50, 50, 23]))
         self.assertIn("fetched 123 subscriptions\n", out)
         musicians = eys.read_text(os.path.join(out_dir, "musicians.md")).splitlines()
         youtubers = eys.read_text(os.path.join(out_dir, "youtubers.md")).splitlines()
@@ -1447,61 +1455,63 @@ class Issue4CliTests(unittest.TestCase):
             "token loop": ScriptedYouTube([sub_page(["UCa"], "t"), sub_page(["UCb"], "t")]),
         }
         for name, yt in failures.items():
-            with self.subTest(name), tempfile.TemporaryDirectory() as d:
-                self.write(d, "youtubers.md", f"{URL}UCold # Old\n")
-                before = self.snapshot(d)
-                code, out, err = self.run_cli("--output-dir", d, "--date", TODAY, youtube=yt)
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp_dir:
+                self.write(tmp_dir, "youtubers.md", f"{URL}UCold # Old\n")
+                before = self.snapshot(tmp_dir)
+                code, out, err = self.run_cli("--output-dir", tmp_dir, "--date", TODAY, youtube=yt)
                 self.assertEqual((code, out), (1, ""))
                 self.assertIn("error: failed to fetch subscriptions:", err)
-                self.assertEqual(self.snapshot(d), before)
+                self.assertEqual(self.snapshot(tmp_dir), before)
         missing_dir = os.path.join(self.sandbox, "never")
         code, _, _ = self.run_cli("--output-dir", missing_dir, youtube=ScriptedYouTube([OSError("x")]))
         self.assertEqual(code, 1)
         self.assertFalse(os.path.exists(missing_dir))
 
     def test_empty_list_guard(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.write(d, "musicians.md", f"# Musicians\n\n{URL}UCa # A\n")
-            before = self.snapshot(d)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.write(tmp_dir, "musicians.md", f"# Musicians\n\n{URL}UCa # A\n")
+            before = self.snapshot(tmp_dir)
             for extra in ((), ("--dry-run",)):
-                code, out, err = self.run_cli("--output-dir", d, *extra, youtube=FakeYouTube(0))
+                code, out, err = self.run_cli("--output-dir", tmp_dir, *extra, youtube=FakeYouTube(0))
                 self.assertEqual((code, out), (2, ""))
                 self.assertIn("0 subscriptions", err)
-                self.assertEqual(self.snapshot(d), before)
-            code, out, _ = self.run_cli("--output-dir", d, "--allow-empty", "--date", TODAY, youtube=FakeYouTube(0))
+                self.assertEqual(self.snapshot(tmp_dir), before)
+            code, out, _ = self.run_cli(
+                "--output-dir", tmp_dir, "--allow-empty", "--date", TODAY, youtube=FakeYouTube(0)
+            )
             self.assertEqual(code, 0)
             self.assertIn("musicians.md: 1 channels, +0 added, 1 newly missing", out)
             self.assertEqual(
-                eys.read_text(os.path.join(d, "musicians.md")),
+                eys.read_text(os.path.join(tmp_dir, "musicians.md")),
                 f"# Musicians\n\n{URL}UCa # A [missing since {TODAY}]\n",
             )
 
     def test_empty_list_with_no_channels_on_file_is_fine(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.write(d, "youtubers.md", "# YouTubers\n\nnotes only\n")
-            before = self.snapshot(d)
-            code, out, _ = self.run_cli("--output-dir", d, youtube=FakeYouTube(0))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.write(tmp_dir, "youtubers.md", "# YouTubers\n\nnotes only\n")
+            before = self.snapshot(tmp_dir)
+            code, out, _ = self.run_cli("--output-dir", tmp_dir, youtube=FakeYouTube(0))
             self.assertEqual(code, 0)
             self.assertIn("fetched 0 subscriptions", out)
-            self.assertEqual(self.snapshot(d), before)  # and no empty musicians.md appears
+            self.assertEqual(self.snapshot(tmp_dir), before)  # and no empty musicians.md appears
 
     # ---- output format ----------------------------------------------------
 
     def test_summary_matches_readme_format(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.write(d, "musicians.md", f"# Musicians\n\n{URL}UCm1 # M1\n{URL}UCm2 # M2\n{URL}UCm3 # M3\n")
-            self.write(d, "youtubers.md", f"# YouTubers\n\n{URL}UCy1 # Y1\n{URL}UCy2 # Y2\n{URL}UCgone # Gone\n")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.write(tmp_dir, "musicians.md", f"# Musicians\n\n{URL}UCm1 # M1\n{URL}UCm2 # M2\n{URL}UCm3 # M3\n")
+            self.write(tmp_dir, "youtubers.md", f"# YouTubers\n\n{URL}UCy1 # Y1\n{URL}UCy2 # Y2\n{URL}UCgone # Gone\n")
             names = {"UCm1": "M1", "UCm2": "M2", "UCm3": "M3", "UCy1": "Y1", "UCy2": "Y2"}
-            subs = [{"id": i, "title": t} for i, t in names.items()]
+            subs = [{"id": channel_id, "title": title} for channel_id, title in names.items()]
             subs += [{"id": "UCn1", "title": "N1 - Topic"}, {"id": "UCn2", "title": "N2VEVO"}]
-            argv = ("--output-dir", d, "--from-json", self.fixture(subs), "--date", TODAY)
+            argv = ("--output-dir", tmp_dir, "--from-json", self.fixture(subs), "--date", TODAY)
             code, out, err = self.run_cli(*argv, "--dry-run")
             self.assertEqual((code, err), (0, ""))
             self.assertEqual(
                 out.splitlines(),
                 [
                     "env file: none",
-                    f"output dir: {os.path.abspath(d)} (from --output-dir)",
+                    f"output dir: {os.path.abspath(tmp_dir)} (from --output-dir)",
                     "fetched 7 subscriptions",
                     "musicians.md: 5 channels, +2 added, 0 newly missing, 0 still missing, 0 restored, 0 renamed",
                     "youtubers.md: 3 channels, +0 added, 1 newly missing, 0 still missing, 0 restored, 0 renamed",
@@ -1520,10 +1530,10 @@ class Issue4CliTests(unittest.TestCase):
             self.assertNotIn("UCn1", out)  # ids only with -v
 
     def test_verbose_lists_restored_and_renamed(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.write(d, "youtubers.md", f"{URL}UCback # Back [missing since 2026-01-01]\n{URL}UCren # Old\n")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.write(tmp_dir, "youtubers.md", f"{URL}UCback # Back [missing since 2026-01-01]\n{URL}UCren # Old\n")
             subs = [{"id": "UCback", "title": "Back"}, {"id": "UCren", "title": "New"}]
-            code, out, _ = self.run_cli("--output-dir", d, "--from-json", self.fixture(subs), "-v")
+            code, out, _ = self.run_cli("--output-dir", tmp_dir, "--from-json", self.fixture(subs), "-v")
             self.assertEqual(code, 0)
             self.assertIn(
                 "youtubers.md: 2 channels, +0 added, 0 newly missing, 0 still missing, 1 restored, 1 renamed", out
@@ -1532,22 +1542,26 @@ class Issue4CliTests(unittest.TestCase):
             self.assertIn("  youtubers.md renamed: UCren", out)
 
     def test_date_defaults_to_today(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.write(d, "youtubers.md", f"{URL}UCgone # Gone\n")
-            code, _, _ = self.run_cli("--output-dir", d, "--from-json", self.fixture([{"id": "UCa", "title": "A"}]))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.write(tmp_dir, "youtubers.md", f"{URL}UCgone # Gone\n")
+            code, _, _ = self.run_cli(
+                "--output-dir", tmp_dir, "--from-json", self.fixture([{"id": "UCa", "title": "A"}])
+            )
             self.assertEqual(code, 0)
             today = eys._dt.date.today().isoformat()
-            self.assertIn(f"{URL}UCgone # Gone [missing since {today}]", eys.read_text(os.path.join(d, "youtubers.md")))
+            self.assertIn(
+                f"{URL}UCgone # Gone [missing since {today}]", eys.read_text(os.path.join(tmp_dir, "youtubers.md"))
+            )
 
     # ---- exit code 2: usage and config ------------------------------------
 
     def test_bad_date_is_usage_error(self):
         for bad in ("2026-13-01", "2026-02-30", "20261115", "2026-1-5", "tomorrow", "2026-11-15T00:00"):
-            with self.subTest(bad), tempfile.TemporaryDirectory() as d:
-                code, out, err = self.run_cli("--output-dir", d, "--date", bad, youtube=FakeYouTube(1))
+            with self.subTest(bad), tempfile.TemporaryDirectory() as tmp_dir:
+                code, out, err = self.run_cli("--output-dir", tmp_dir, "--date", bad, youtube=FakeYouTube(1))
                 self.assertEqual((code, out), (2, ""))
                 self.assertIn("--date", err)
-                self.assertEqual(os.listdir(d), [])
+                self.assertEqual(os.listdir(tmp_dir), [])
 
     def test_argparse_usage_errors_exit_2_and_help_exits_0(self):
         for argv, expected in ((["--bogus"], 2), (["--date"], 2), (["stray"], 2), (["--help"], 0), (["-h"], 0)):
@@ -1574,13 +1588,13 @@ class Issue4CliTests(unittest.TestCase):
             "topics not a list": [{"id": "UCa", "title": "A", "topicIds": "/m/04rlf"}],
         }
         for name, data in bad_fixtures.items():
-            with self.subTest(name), tempfile.TemporaryDirectory() as d:
-                self.write(d, "youtubers.md", f"{URL}UCold # Old\n")
-                before = self.snapshot(d)
-                code, out, err = self.run_cli("--output-dir", d, "--from-json", self.fixture(data))
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp_dir:
+                self.write(tmp_dir, "youtubers.md", f"{URL}UCold # Old\n")
+                before = self.snapshot(tmp_dir)
+                code, out, err = self.run_cli("--output-dir", tmp_dir, "--from-json", self.fixture(data))
                 self.assertEqual((code, out), (2, ""))
                 self.assertIn("--from-json fixture", err)
-                self.assertEqual(self.snapshot(d), before)
+                self.assertEqual(self.snapshot(tmp_dir), before)
         code, _, err = self.run_cli("--from-json", os.path.join(self.sandbox, "missing.json"))
         self.assertEqual(code, 2)
         self.assertIn("missing.json", err)
@@ -1591,14 +1605,14 @@ class Issue4CliTests(unittest.TestCase):
         self.assertEqual(chans, [Channel("UCa", "", [], []), Channel("UCb", "", [], [])])
 
     def test_unreadable_existing_file_is_exit_2(self):
-        with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "musicians.md"), "wb") as f:
-                f.write(b"\xff\xfe not utf-8\n")
-            before = self.snapshot(d)
-            code, out, err = self.run_cli("--output-dir", d, youtube=FakeYouTube(2))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with open(os.path.join(tmp_dir, "musicians.md"), "wb") as handle:
+                handle.write(b"\xff\xfe not utf-8\n")
+            before = self.snapshot(tmp_dir)
+            code, out, err = self.run_cli("--output-dir", tmp_dir, youtube=FakeYouTube(2))
             self.assertEqual((code, out), (2, ""))
             self.assertIn("cannot read the existing files", err)
-            self.assertEqual(self.snapshot(d), before)
+            self.assertEqual(self.snapshot(tmp_dir), before)
 
     def test_write_failure_is_exit_2_not_a_traceback(self):
         def refuse(steps):
@@ -1607,21 +1621,21 @@ class Issue4CliTests(unittest.TestCase):
 
         original, eys.write_files = eys.write_files, refuse
         try:
-            with tempfile.TemporaryDirectory() as d:
-                code, _, err = self.run_cli("--output-dir", d, youtube=FakeYouTube(2))
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                code, _, err = self.run_cli("--output-dir", tmp_dir, youtube=FakeYouTube(2))
                 self.assertEqual(code, 2)
                 self.assertIn("cannot write", err)
-                self.assertEqual(os.listdir(d), [])
+                self.assertEqual(os.listdir(tmp_dir), [])
         finally:
             eys.write_files = original
 
     def test_missing_google_libraries_is_exit_2_with_install_hint(self):
         blocked = dict.fromkeys(GOOGLE_TOP_LEVEL)  # None in sys.modules makes the import fail
-        with mock.patch.dict(sys.modules, blocked), tempfile.TemporaryDirectory() as d:
-            code, out, err = self.run_cli("--output-dir", d, "--token", os.path.join(d, "token.json"))
+        with mock.patch.dict(sys.modules, blocked), tempfile.TemporaryDirectory() as tmp_dir:
+            code, out, err = self.run_cli("--output-dir", tmp_dir, "--token", os.path.join(tmp_dir, "token.json"))
             self.assertEqual((code, out), (2, ""))
             self.assertIn("requirements.txt", err)
-            self.assertEqual(os.listdir(d), [])
+            self.assertEqual(os.listdir(tmp_dir), [])
 
 
 # ---- OAuth, exercised against stand-ins for the Google libraries ----------
@@ -1664,8 +1678,8 @@ class FakeGoogle:
 
     def _flow(self, path, scopes):
         self.calls.append(("flow", path, tuple(scopes)))
-        with open(path, encoding="utf-8") as f:
-            json.load(f)["installed"]  # the real library rejects non-Desktop files too
+        with open(path, encoding="utf-8") as handle:
+            json.load(handle)["installed"]  # the real library rejects non-Desktop files too
         return self
 
     def run_local_server(self, **kwargs):
@@ -1709,8 +1723,8 @@ class Issue4AuthTests(unittest.TestCase):
         self.addCleanup(self._sandbox.cleanup)
         self.sandbox = self._sandbox.name
         self.secrets = os.path.join(self.sandbox, "client_secret.json")
-        with open(self.secrets, "w", encoding="utf-8") as f:
-            json.dump({"installed": {"client_id": "fake"}}, f)
+        with open(self.secrets, "w", encoding="utf-8") as handle:
+            json.dump({"installed": {"client_id": "fake"}}, handle)
         self.token = os.path.join(self.sandbox, "config", "token.json")
 
     def install(self, google):
@@ -1721,8 +1735,8 @@ class Issue4AuthTests(unittest.TestCase):
 
     def cache_token(self, mode=0o600):
         os.makedirs(os.path.dirname(self.token), exist_ok=True)
-        with open(self.token, "w", encoding="utf-8") as f:
-            f.write("{}")
+        with open(self.token, "w", encoding="utf-8") as handle:
+            handle.write("{}")
         os.chmod(self.token, mode)
 
     def mode(self, path):
@@ -1808,8 +1822,8 @@ class Issue4AuthTests(unittest.TestCase):
 
     def test_missing_or_invalid_client_secrets_is_usage_error(self):
         self.install(FakeGoogle())
-        with open(self.secrets, "w", encoding="utf-8") as f:
-            f.write('{"web": {}}')
+        with open(self.secrets, "w", encoding="utf-8") as handle:
+            handle.write('{"web": {}}')
         with self.assertRaisesRegex(eys.UsageError, "cannot use OAuth client secrets"):
             self.credentials()
         os.unlink(self.secrets)
@@ -1878,8 +1892,8 @@ class Issue4AuthTests(unittest.TestCase):
 
 class Issue4PackagingTests(unittest.TestCase):
     def read(self, name):
-        with open(os.path.join(REPO_DIR, name), encoding="utf-8") as f:
-            return f.read()
+        with open(os.path.join(REPO_DIR, name), encoding="utf-8") as handle:
+            return handle.read()
 
     def test_google_libraries_are_only_imported_inside_functions(self):
         tree = ast.parse(self.read("export_youtube_subscriptions.py"))
@@ -1907,12 +1921,12 @@ class Issue4PackagingTests(unittest.TestCase):
             f"loaded = sorted(m for m in sys.modules if m.split('.')[0] in {GOOGLE_TOP_LEVEL!r})\n"
             "sys.exit(code or (3 if loaded else 0))\n"
         )
-        with tempfile.TemporaryDirectory() as d:
-            fixture = os.path.join(d, "subs.json")
-            with open(fixture, "w", encoding="utf-8") as f:
-                json.dump([{"id": "UCa", "title": "A"}], f)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fixture = os.path.join(tmp_dir, "subs.json")
+            with open(fixture, "w", encoding="utf-8") as handle:
+                json.dump([{"id": "UCa", "title": "A"}], handle)
             done = subprocess.run(
-                [sys.executable, "-c", script, fixture, d], cwd=REPO_DIR, capture_output=True, text=True
+                [sys.executable, "-c", script, fixture, tmp_dir], cwd=REPO_DIR, capture_output=True, text=True
             )
         self.assertEqual(done.returncode, 0, done.stderr)
 
@@ -1974,17 +1988,17 @@ class Issue5DropGuardMergeTests(unittest.TestCase):
     def test_exactly_at_the_threshold_is_allowed(self):
         for listed, dropped in ((30, 6), (100, 20), (35, 7)):
             with self.subTest(listed=listed):
-                r = self.drop(listed, dropped)
-                self.assertEqual(len(r.summary[YOUTUBER].newly_missing), dropped)
+                result = self.drop(listed, dropped)
+                self.assertEqual(len(result.summary[YOUTUBER].newly_missing), dropped)
 
     def test_one_above_the_threshold_is_refused(self):
         for listed, dropped, limit in ((30, 7, 6), (100, 21, 20), (35, 8, 7)):
             with self.subTest(listed=listed), self.assertRaises(DropGuardError) as caught:
                 self.drop(listed, dropped)
-            e = caught.exception
-            self.assertEqual((e.newly_missing, e.active, e.limit), (dropped, listed, limit))
-            self.assertIn(f"{dropped} of {listed} listed channel(s)", str(e))
-            self.assertIn(f"drop threshold of {limit} ", str(e))
+            error = caught.exception
+            self.assertEqual((error.newly_missing, error.active, error.limit), (dropped, listed, limit))
+            self.assertIn(f"{dropped} of {listed} listed channel(s)", str(error))
+            self.assertIn(f"drop threshold of {limit} ", str(error))
 
     def test_percent_boundary_is_not_rounded_up(self):
         # 20% of 26 is 5.2: six is already "more than", five is the floor.
@@ -1996,8 +2010,8 @@ class Issue5DropGuardMergeTests(unittest.TestCase):
         # Up to 5 may always go, even when that is the whole list.
         for listed in (1, 3, 5):
             with self.subTest(listed=listed):
-                r = self.drop(listed, listed)
-                self.assertEqual(len(r.summary[YOUTUBER].newly_missing), listed)
+                result = self.drop(listed, listed)
+                self.assertEqual(len(result.summary[YOUTUBER].newly_missing), listed)
         self.assertEqual(len(self.drop(8, 5).summary[YOUTUBER].newly_missing), 5)
         for listed in (6, 8, 25):
             with self.subTest(listed=listed), self.assertRaises(DropGuardError) as caught:
@@ -2005,15 +2019,15 @@ class Issue5DropGuardMergeTests(unittest.TestCase):
             self.assertEqual(caught.exception.limit, 5)
 
     def test_allow_drop_bypasses(self):
-        r = self.drop(30, 30, allow_drop=True)
-        self.assertEqual(len(r.summary[YOUTUBER].newly_missing), 30)
-        self.assertTrue(all(line.endswith(f"[missing since {TODAY}]") for line in r.contents[YOUTUBER][:30]))
+        result = self.drop(30, 30, allow_drop=True)
+        self.assertEqual(len(result.summary[YOUTUBER].newly_missing), 30)
+        self.assertTrue(all(line.endswith(f"[missing since {TODAY}]") for line in result.contents[YOUTUBER][:30]))
 
     def test_allow_empty_implies_allow_drop(self):
         self.assertEqual(len(self.drop(30, 30, allow_empty=True).summary[YOUTUBER].newly_missing), 30)
         # ... and for the case it exists for: nothing came back at all.
-        r = merge({YOUTUBER: _listed(30)}, [], TODAY, allow_empty=True)
-        self.assertEqual(len(r.summary[YOUTUBER].newly_missing), 30)
+        result = merge({YOUTUBER: _listed(30)}, [], TODAY, allow_empty=True)
+        self.assertEqual(len(result.summary[YOUTUBER].newly_missing), 30)
 
     def test_empty_list_still_hits_the_empty_guard_first(self):
         with self.assertRaises(EmptySubscriptionsError):
@@ -2025,8 +2039,8 @@ class Issue5DropGuardMergeTests(unittest.TestCase):
         musicians, youtubers = _listed(15, "UCm"), _listed(15, "UCy")
         existing = {MUSICIAN: musicians, YOUTUBER: youtubers}
         # 3 + 3 = 6 of 30: at the threshold, though each file alone lost 20%.
-        r = merge(existing, _kept(musicians, 3) + _kept(youtubers, 3), TODAY)
-        self.assertEqual([len(s.newly_missing) for s in r.summary.values()], [3, 3])
+        result = merge(existing, _kept(musicians, 3) + _kept(youtubers, 3), TODAY)
+        self.assertEqual([len(summary.newly_missing) for summary in result.summary.values()], [3, 3])
         with self.assertRaises(DropGuardError) as caught:  # 4 + 3 = 7 of 30
             merge(existing, _kept(musicians, 4) + _kept(youtubers, 3), TODAY)
         self.assertEqual((caught.exception.newly_missing, caught.exception.active), (7, 30))
@@ -2036,9 +2050,9 @@ class Issue5DropGuardMergeTests(unittest.TestCase):
         old = _listed(200, "UCold", "2026-01-01")
         existing = {MUSICIAN: old, YOUTUBER: active}
         # Not as drops: 200 still-missing lines plus 6 new drops stays allowed.
-        r = merge(existing, _kept(active, 6), TODAY)
-        self.assertEqual(len(r.summary[MUSICIAN].still_missing), 200)
-        self.assertEqual(len(r.summary[YOUTUBER].newly_missing), 6)
+        result = merge(existing, _kept(active, 6), TODAY)
+        self.assertEqual(len(result.summary[MUSICIAN].still_missing), 200)
+        self.assertEqual(len(result.summary[YOUTUBER].newly_missing), 6)
         # Nor in the base: 7 is refused against the 30 active channels, where
         # 20% of all 230 listed would have let 46 through.
         with self.assertRaises(DropGuardError) as caught:
@@ -2047,15 +2061,15 @@ class Issue5DropGuardMergeTests(unittest.TestCase):
 
     def test_only_already_missing_channels_never_trips(self):
         old = _listed(50, "UCold", "2026-01-01")
-        r = merge({YOUTUBER: old}, [ch("UCnew", "New")], TODAY)
-        self.assertEqual(len(r.summary[YOUTUBER].still_missing), 50)
-        self.assertEqual(r.contents[YOUTUBER][:50], old)
+        result = merge({YOUTUBER: old}, [ch("UCnew", "New")], TODAY)
+        self.assertEqual(len(result.summary[YOUTUBER].still_missing), 50)
+        self.assertEqual(result.contents[YOUTUBER][:50], old)
 
     def test_first_run_never_trips(self):
         subs = [ch(f"UCn{i:03d}", f"N{i}") for i in range(300)]
         for existing in ({}, {MUSICIAN: [], YOUTUBER: []}, {YOUTUBER: ["# YouTubers", "", "a note"]}):
-            r = merge(existing, subs, TODAY)
-            self.assertEqual(sum(len(s.added) for s in r.summary.values()), 300)
+            result = merge(existing, subs, TODAY)
+            self.assertEqual(sum(len(summary.added) for summary in result.summary.values()), 300)
         self.assertIsNone(eys.check_drop(merge({}, [], TODAY).summary))
 
     def test_restored_and_added_channels_do_not_offset_drops(self):
@@ -2076,8 +2090,8 @@ class Issue5DropGuardMergeTests(unittest.TestCase):
     def test_duplicate_lines_count_once(self):
         lines = _listed(30)
         existing = {YOUTUBER: lines + lines[:6]}  # the 6 dropped ids each appear twice
-        r = merge(existing, _kept(lines, 6) + [ch("UCnew", "New")], TODAY)
-        self.assertEqual(len(r.summary[YOUTUBER].newly_missing), 6)
+        result = merge(existing, _kept(lines, 6) + [ch("UCnew", "New")], TODAY)
+        self.assertEqual(len(result.summary[YOUTUBER].newly_missing), 6)
 
     def test_refusal_leaves_the_input_untouched(self):
         lines = _listed(30)
@@ -2087,8 +2101,8 @@ class Issue5DropGuardMergeTests(unittest.TestCase):
         self.assertEqual(existing, {YOUTUBER: lines})
 
     def test_check_drop_reports_without_raising(self):
-        r = self.drop(30, 7, allow_drop=True)
-        tripped = eys.check_drop(r.summary)
+        result = self.drop(30, 7, allow_drop=True)
+        tripped = eys.check_drop(result.summary)
         self.assertIsInstance(tripped, DropGuardError)
         self.assertEqual((tripped.newly_missing, tripped.active, tripped.limit), (7, 30, 6))
         self.assertIsNone(eys.check_drop(self.drop(30, 6).summary))
@@ -2103,10 +2117,10 @@ class Issue5DropGuardCliTests(unittest.TestCase):
         """Write both files plus overrides.txt; return the channel lines."""
         lines = {MUSICIAN: _listed(musicians, "UCm"), YOUTUBER: _listed(youtubers, "UCy")}
         for cat, header in ((MUSICIAN, "# Musicians"), (YOUTUBER, "# YouTubers")):
-            with open(os.path.join(directory, eys.FILENAMES[cat]), "w", encoding="utf-8") as f:
-                f.write("\n".join([header, "", *lines[cat]]) + "\n")
-        with open(os.path.join(directory, "overrides.txt"), "w", encoding="utf-8") as f:
-            f.write("# none\n")
+            with open(os.path.join(directory, eys.FILENAMES[cat]), "w", encoding="utf-8") as handle:
+                handle.write("\n".join([header, "", *lines[cat]]) + "\n")
+        with open(os.path.join(directory, "overrides.txt"), "w", encoding="utf-8") as handle:
+            handle.write("# none\n")
         return lines
 
     def subs(self, lines, dropped):
@@ -2121,73 +2135,73 @@ class Issue5DropGuardCliTests(unittest.TestCase):
         return out
 
     def test_refusal_exits_2_and_touches_nothing(self):
-        with tempfile.TemporaryDirectory() as d:
-            lines = self.seed(d)
-            content, stats = self.snapshot(d), self.stat_snapshot(d)
-            code, out, err = self.run_cli("--output-dir", d, "--date", TODAY, fetch=self.subs(lines, 7))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lines = self.seed(tmp_dir)
+            content, stats = self.snapshot(tmp_dir), self.stat_snapshot(tmp_dir)
+            code, out, err = self.run_cli("--output-dir", tmp_dir, "--date", TODAY, fetch=self.subs(lines, 7))
             self.assertEqual((code, out), (2, ""))
             self.assertIn("7 of 30 listed channel(s) would be newly marked missing", err)
             self.assertIn("drop threshold of 6 (the larger of 5 and 20%)", err)
             self.assertIn("--allow-drop", err)
             self.assertEqual(err.count("\n"), 1)
             # Same bytes, same inodes, same mtimes, and no temp file left behind.
-            self.assertEqual(self.snapshot(d), content)
-            self.assertEqual(self.stat_snapshot(d), stats)
+            self.assertEqual(self.snapshot(tmp_dir), content)
+            self.assertEqual(self.stat_snapshot(tmp_dir), stats)
 
     def test_refusal_never_calls_the_writer(self):
-        with tempfile.TemporaryDirectory() as d:
-            lines = self.seed(d)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lines = self.seed(tmp_dir)
             with mock.patch.object(eys, "write_files") as writer, mock.patch.object(eys.os, "makedirs") as mkdirs:
-                code, _, _ = self.run_cli("--output-dir", d, fetch=self.subs(lines, 30))
+                code, _, _ = self.run_cli("--output-dir", tmp_dir, fetch=self.subs(lines, 30))
             self.assertEqual(code, 2)
             writer.assert_not_called()
             mkdirs.assert_not_called()
 
     def test_at_the_threshold_writes(self):
-        with tempfile.TemporaryDirectory() as d:
-            lines = self.seed(d)
-            code, out, err = self.run_cli("--output-dir", d, "--date", TODAY, fetch=self.subs(lines, 6))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lines = self.seed(tmp_dir)
+            code, out, err = self.run_cli("--output-dir", tmp_dir, "--date", TODAY, fetch=self.subs(lines, 6))
             self.assertEqual((code, err), (0, ""))
             self.assertIn("youtubers.md: 20 channels, +0 added, 6 newly missing", out)
             self.assertNotIn("warning", out)
-            self.assertEqual(eys.read_text(os.path.join(d, "youtubers.md")).count(f"[missing since {TODAY}]"), 6)
+            self.assertEqual(eys.read_text(os.path.join(tmp_dir, "youtubers.md")).count(f"[missing since {TODAY}]"), 6)
 
     def test_allow_drop_writes(self):
-        with tempfile.TemporaryDirectory() as d:
-            lines = self.seed(d)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lines = self.seed(tmp_dir)
             code, out, err = self.run_cli(
-                "--output-dir", d, "--allow-drop", "--date", TODAY, fetch=self.subs(lines, 7)
+                "--output-dir", tmp_dir, "--allow-drop", "--date", TODAY, fetch=self.subs(lines, 7)
             )
             self.assertEqual((code, err), (0, ""))
             self.assertIn("youtubers.md: 20 channels, +0 added, 7 newly missing", out)
             self.assertNotIn("warning", out)
-            self.assertEqual(eys.read_text(os.path.join(d, "youtubers.md")).count(f"[missing since {TODAY}]"), 7)
+            self.assertEqual(eys.read_text(os.path.join(tmp_dir, "youtubers.md")).count(f"[missing since {TODAY}]"), 7)
 
     def test_allow_empty_implies_allow_drop(self):
-        with tempfile.TemporaryDirectory() as d:
-            lines = self.seed(d)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lines = self.seed(tmp_dir)
             code, out, err = self.run_cli(
-                "--output-dir", d, "--allow-empty", "--date", TODAY, fetch=self.subs(lines, 7)
+                "--output-dir", tmp_dir, "--allow-empty", "--date", TODAY, fetch=self.subs(lines, 7)
             )
             self.assertEqual((code, err), (0, ""))
             self.assertIn("7 newly missing", out)
             self.assertNotIn("warning", out)
 
     def test_allow_drop_does_not_imply_allow_empty(self):
-        with tempfile.TemporaryDirectory() as d:
-            self.seed(d)
-            before = self.snapshot(d)
-            code, _, err = self.run_cli("--output-dir", d, "--allow-drop", fetch=lambda: [])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.seed(tmp_dir)
+            before = self.snapshot(tmp_dir)
+            code, _, err = self.run_cli("--output-dir", tmp_dir, "--allow-drop", fetch=lambda: [])
             self.assertEqual(code, 2)
             self.assertIn("--allow-empty", err)
-            self.assertEqual(self.snapshot(d), before)
+            self.assertEqual(self.snapshot(tmp_dir), before)
 
     def test_dry_run_reports_and_warns(self):
-        with tempfile.TemporaryDirectory() as d:
-            lines = self.seed(d)
-            content, stats = self.snapshot(d), self.stat_snapshot(d)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lines = self.seed(tmp_dir)
+            content, stats = self.snapshot(tmp_dir), self.stat_snapshot(tmp_dir)
             code, out, err = self.run_cli(
-                "--output-dir", d, "--dry-run", "-v", "--date", TODAY, fetch=self.subs(lines, 7)
+                "--output-dir", tmp_dir, "--dry-run", "-v", "--date", TODAY, fetch=self.subs(lines, 7)
             )
             self.assertEqual((code, err), (0, ""))
             self.assertIn("youtubers.md: 20 channels, +0 added, 7 newly missing", out)
@@ -2200,25 +2214,25 @@ class Issue5DropGuardCliTests(unittest.TestCase):
             self.assertIn("dry run: no files written", out)
             for line in lines[YOUTUBER][:7]:  # -v names what would be marked
                 self.assertIn(f"  youtubers.md newly missing: {parse_line(line).id}\n", out)
-            self.assertEqual(self.snapshot(d), content)
-            self.assertEqual(self.stat_snapshot(d), stats)
+            self.assertEqual(self.snapshot(tmp_dir), content)
+            self.assertEqual(self.stat_snapshot(tmp_dir), stats)
 
     def test_dry_run_warns_only_when_a_real_run_would_refuse(self):
-        with tempfile.TemporaryDirectory() as d:
-            lines = self.seed(d)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lines = self.seed(tmp_dir)
             for argv, dropped in ((("--dry-run",), 6), (("--dry-run", "--allow-drop"), 7),
                                   (("--dry-run", "--allow-empty"), 7)):
                 with self.subTest(argv=argv):
-                    code, out, _ = self.run_cli("--output-dir", d, *argv, fetch=self.subs(lines, dropped))
+                    code, out, _ = self.run_cli("--output-dir", tmp_dir, *argv, fetch=self.subs(lines, dropped))
                     self.assertEqual(code, 0)
                     self.assertIn(f"{dropped} newly missing", out)
                     self.assertNotIn("warning", out)
 
     def test_dry_run_empty_list_still_refuses(self):
         # The empty-list guard is unchanged: it exits 2 under --dry-run too.
-        with tempfile.TemporaryDirectory() as d:
-            self.seed(d)
-            code, out, err = self.run_cli("--output-dir", d, "--dry-run", fetch=lambda: [])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.seed(tmp_dir)
+            code, out, err = self.run_cli("--output-dir", tmp_dir, "--dry-run", fetch=lambda: [])
             self.assertEqual((code, out), (2, ""))
             self.assertIn("0 subscriptions", err)
 
@@ -2230,21 +2244,21 @@ class Issue5DropGuardCliTests(unittest.TestCase):
         self.assertIn("youtubers.md: 120 channels, +120 added, 0 newly missing", out)
 
     def test_already_missing_do_not_count_end_to_end(self):
-        with tempfile.TemporaryDirectory() as d:
-            lines = self.seed(d)
-            self.run_cli("--output-dir", d, "--date", TODAY, fetch=self.subs(lines, 6))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lines = self.seed(tmp_dir)
+            self.run_cli("--output-dir", tmp_dir, "--date", TODAY, fetch=self.subs(lines, 6))
             # 6 are now marked: 24 active, floor 5. The same list again is a no-op...
-            before = self.snapshot(d)
-            code, out, _ = self.run_cli("--output-dir", d, "--date", LATER, fetch=self.subs(lines, 6))
+            before = self.snapshot(tmp_dir)
+            code, out, _ = self.run_cli("--output-dir", tmp_dir, "--date", LATER, fetch=self.subs(lines, 6))
             self.assertEqual(code, 0)
             self.assertIn("0 newly missing, 6 still missing", out)
-            self.assertEqual(self.snapshot(d), before)
+            self.assertEqual(self.snapshot(tmp_dir), before)
             # ...5 more go through, a 6th would not.
-            code, _, err = self.run_cli("--output-dir", d, "--date", LATER, fetch=self.subs(lines, 12))
+            code, _, err = self.run_cli("--output-dir", tmp_dir, "--date", LATER, fetch=self.subs(lines, 12))
             self.assertEqual(code, 2)
             self.assertIn("6 of 24 listed channel(s)", err)
-            self.assertEqual(self.snapshot(d), before)
-            code, out, _ = self.run_cli("--output-dir", d, "--date", LATER, fetch=self.subs(lines, 11))
+            self.assertEqual(self.snapshot(tmp_dir), before)
+            code, out, _ = self.run_cli("--output-dir", tmp_dir, "--date", LATER, fetch=self.subs(lines, 11))
             self.assertEqual(code, 0)
             self.assertIn("5 newly missing, 6 still missing", out)
 
@@ -2256,8 +2270,8 @@ class Issue5DropGuardCliTests(unittest.TestCase):
 
     def test_readme_documents_allow_drop(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
-            readme = f.read()
+        with open(os.path.join(root, "README.md"), encoding="utf-8") as handle:
+            readme = handle.read()
         self.assertIn("| `--allow-drop` |", readme)
         floor, percent = eys.DROP_THRESHOLD
         self.assertIn(f"max({floor}, {percent}%)", readme)
@@ -2720,8 +2734,8 @@ class Issue6ApplyOverridesCliTests(unittest.TestCase):
             self.assertNotIn("->", err)
 
     def test_readme_documents_the_flag(self):
-        with open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as f:
-            readme = f.read()
+        with open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as handle:
+            readme = handle.read()
         self.assertIn("| `--apply-overrides` |", readme)
         self.assertIn("moved in", readme)
 
@@ -2772,8 +2786,8 @@ class Issue11AuthPortTests(unittest.TestCase):
         google = self.install(FakeGoogle(resource=FakeYouTube(1)))
         out_dir = os.path.join(self.sandbox, "out")
         os.makedirs(out_dir)
-        with open(os.path.join(out_dir, "youtubers.md"), "wb") as f:
-            f.write(b"\xff not utf-8\n")
+        with open(os.path.join(out_dir, "youtubers.md"), "wb") as handle:
+            handle.write(b"\xff not utf-8\n")
         code, out, err = self.run_cli("--client-secrets", self.secrets, "--no-browser")
         self.assertEqual((code, out), (2, ""))
         self.assertIn("cannot read the existing files", err)
@@ -2790,19 +2804,19 @@ class Issue11CliTests(unittest.TestCase):
         }
         for name, make in unreadable.items():
             for filename in ("musicians.md", "youtubers.md"):
-                with self.subTest(name, file=filename), tempfile.TemporaryDirectory() as d:
-                    make(os.path.join(d, filename))
+                with self.subTest(name, file=filename), tempfile.TemporaryDirectory() as tmp_dir:
+                    make(os.path.join(tmp_dir, filename))
                     fetch = mock.Mock(return_value=[ch("UCa", "A")])
-                    code, out, err = self.run_cli("--output-dir", d, fetch=fetch)
+                    code, out, err = self.run_cli("--output-dir", tmp_dir, fetch=fetch)
                     self.assertEqual((code, out), (2, ""))
                     self.assertIn("cannot read the existing files", err)
                     fetch.assert_not_called()
 
     def test_from_json_is_not_read_when_existing_file_is_unreadable(self):
-        with tempfile.TemporaryDirectory() as d:
-            os.mkdir(os.path.join(d, "musicians.md"))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.mkdir(os.path.join(tmp_dir, "musicians.md"))
             with mock.patch.object(eys, "load_json_channels") as load_json:
-                code, _, _ = self.run_cli("--output-dir", d, "--from-json", os.path.join(d, "subs.json"))
+                code, _, _ = self.run_cli("--output-dir", tmp_dir, "--from-json", os.path.join(tmp_dir, "subs.json"))
             self.assertEqual(code, 2)
             load_json.assert_not_called()
 
@@ -2825,8 +2839,8 @@ class Issue11CliTests(unittest.TestCase):
 
 class Issue11ReadmeTests(unittest.TestCase):
     def setUp(self):
-        with open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as f:
-            self.readme = f.read()
+        with open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as handle:
+            self.readme = handle.read()
 
     def exit_codes_section(self):
         start = self.readme.index("Exit codes:")
@@ -2855,8 +2869,8 @@ class Issue17ReadmeTests(unittest.TestCase):
     """README wording that must track write_files/plan_writes and main()."""
 
     def setUp(self):
-        with open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as f:
-            self.readme = f.read()
+        with open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as handle:
+            self.readme = handle.read()
 
     def flat(self, start_marker, end_marker):
         start = self.readme.index(start_marker)
