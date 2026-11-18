@@ -2874,13 +2874,38 @@ class Issue17ReadmeTests(unittest.TestCase):
     def test_write_failure_paragraph_matches_the_two_phases(self):
         paragraph = self.write_failure_paragraph()
         for needle in (
-            "neither file is replaced",  # staging failure
+            "every changed file is written to a temp file",  # staging covers every step, not a pair
+            "no file is replaced",  # staging failure
             "half applied",  # rename failure
+            "some files replaced, others not",
             "in at least one file",
             "Rerun with `--apply-overrides`",
             "byte-identical",
         ):
             self.assertIn(needle, paragraph)
+
+    def test_write_failure_wording_allows_three_renames(self):
+        # PR #19 review: plan_writes makes three renames when lines move both
+        # ways, so a failed third rename leaves both files replaced.
+        paragraph = self.write_failure_paragraph().lower()
+        overrides = self.flat("**A failed write never loses a moved line.**", "## Safety").lower()
+        for text in (paragraph, overrides):
+            self.assertNotIn("the other not", text)
+            self.assertNotIn("both files are", text)
+            self.assertNotIn("two renames", text)
+            self.assertNotIn("the pair is not", text)
+        self.assertIn("three renames", paragraph)
+        self.assertIn("three renames", overrides)
+
+    def test_moved_lines_are_printed_on_any_write_failure(self):
+        # main() prints the moved lines for staging failures too, not only renames.
+        paragraph = " ".join(self.write_failure_paragraph().split())
+        self.assertNotIn("The error then prints", paragraph)
+        self.assertIn("On any write failure during a move, the error also prints each moved line", paragraph)
+
+    def test_exit_2_env_bullet_parses(self):
+        bullet = next(line for line in self.readme.splitlines() if line.lstrip().startswith("- an env file"))
+        self.assertIn("whether named or found automatically; or one named with", bullet)
 
     def test_exit_2_covers_an_unreadable_env_file(self):
         bullet = next(line for line in self.readme.splitlines() if line.lstrip().startswith("- an env file"))
@@ -2900,6 +2925,49 @@ class Issue17ReadmeTests(unittest.TestCase):
         docstring = " ".join(eys.merge.__doc__.split())
         self.assertIn("as rendered", docstring)
         self.assertIn("as this run writes", docstring)
+
+
+class Issue17BothWaysThirdRenameTests(unittest.TestCase):
+    """The README case PR #19 got wrong: the third rename of a two-way move fails."""
+
+    setUp, tearDown, run_cli = CliTests.setUp, CliTests.tearDown, CliTests.run_cli
+    snapshot = Issue4CliTests.snapshot
+    MUSICIANS, YOUTUBERS = Issue6ApplyOverridesCliTests.MUSICIANS, Issue6ApplyOverridesCliTests.YOUTUBERS
+    TEACH, VLOG = Issue6ApplyOverridesCliTests.TEACH, Issue6ApplyOverridesCliTests.VLOG
+    seed = Issue6ApplyOverridesCliTests.seed
+    seed_scenario = Issue6ApplyOverridesCliTests.seed_scenario
+    run_failing = Issue6ApplyOverridesCliTests.run_failing
+
+    def test_third_rename_fails_both_files_replaced_no_line_lost(self):
+        overrides, moved = Issue6ApplyOverridesCliTests.SCENARIOS["both ways"]
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed_scenario(directory, overrides)
+            self.assertEqual(self.run_cli(*argv, "--apply-overrides")[0], 0)
+            clean = self.snapshot(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed_scenario(directory, overrides)
+            before = self.snapshot(directory)
+            code, _, err, failed = self.run_failing(argv, eys.os, "replace", 3)
+            self.assertEqual((code, os.path.basename(failed[1])), (2, "musicians.md"))
+            self.assertIn(f"error: cannot write {os.path.join(directory, 'musicians.md')!r}", err)
+            after = self.snapshot(directory)
+            self.assertEqual([name for name in os.listdir(directory) if name.endswith(".tmp")], [])
+            # Both files replaced: "one file replaced, the other not" is false here.
+            for name in ("musicians.md", "youtubers.md"):
+                self.assertNotEqual(after[name], before[name], name)
+            self.assertEqual(after["youtubers.md"], clean["youtubers.md"])  # final content
+            # musicians.md is left in its intermediate state: new content plus the line leaving it.
+            self.assertNotEqual(after["musicians.md"], clean["musicians.md"])
+            self.assertIn(self.TEACH + "\n", after["musicians.md"].decode())
+            self.assertIn(self.VLOG + "\n", after["musicians.md"].decode())
+            files = after["musicians.md"].decode() + after["youtubers.md"].decode()
+            for line in moved:
+                self.assertIn(line + "\n", files)  # every moved line in at least one file
+                self.assertIn(line, err)  # and printed in full
+            # A rerun with the flag finishes the move: one copy of each line.
+            code, _, err = self.run_cli(*argv, "--apply-overrides")
+            self.assertEqual((code, err), (0, ""))
+            self.assertEqual(self.snapshot(directory), clean)
 
 
 if __name__ == "__main__":
