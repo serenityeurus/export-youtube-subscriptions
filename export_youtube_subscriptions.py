@@ -432,7 +432,8 @@ def merge(
         in the file it moves to. Every line of a duplicated id that sits in
         the wrong file moves. The one exception to "no line is ever deleted":
         a moved line that is byte-identical to a line the destination already
-        holds in place is dropped instead of appended (a warning says so), so
+        holds in place, both compared as rendered (as this run writes them), is
+        dropped instead of appended (a warning says so), so
         a rerun after a half-applied move heals instead of doubling the line.
         A line that differs in any byte is never deleted.
       * A channel id on several lines (hand edits): every line is updated and

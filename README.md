@@ -43,6 +43,8 @@ python3 export-youtube-subscriptions --output-dir ~/notes/youtube
 
 On the first run, a browser opens for Google sign-in. The token is cached at `~/.config/export-youtube-subscriptions/token.json` (or `$XDG_CONFIG_HOME/...`) with mode `600`. Use `--token PATH` to change the location.
 
+`musicians.md` and `youtubers.md` are read before the fetch and sign-in, and written after. If you edit them by hand while an interactive sign-in is waiting, the run overwrites those edits. Finish the sign-in first, then edit.
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--output-dir DIR` | `$EYS_OUTPUT_DIR`, else `.` | Where `musicians.md`, `youtubers.md` and `overrides.txt` live. Created if missing |
@@ -73,6 +75,8 @@ ssh -L 8765:localhost:8765 <host>
 
 Open the printed URL in the laptop's browser and sign in. The redirect to `localhost:8765` goes through the tunnel to the tool. Keep the SSH session open until the run prints its summary. This is needed only when there is no usable cached token. Later runs (including from cron) refresh the token without a browser.
 
+If the port is already in use on the host, the run exits with code 1 and an error ending in `Address already in use`. Pick another port and use it on both sides of the tunnel: in `ssh -L` and in `--auth-port`.
+
 Every run prints which env file was loaded, the resolved output directory and where it came from, then a summary for each file, for example:
 
 ```
@@ -89,7 +93,7 @@ Exit codes:
 - `1`: API, auth or network error (including a token refresh that fails on the network). No files are touched.
 - `2`: the run refused or failed. Every case:
   - a bad option, or a `--date` that isn't a real date as `YYYY-MM-DD`;
-  - an env file that is malformed, or that was named with `--env-file` or `$EYS_ENV_FILE` and doesn't exist;
+  - an env file that is malformed or can't be read (permissions, not UTF-8), whether named or found automatically; or one named with `--env-file` or `$EYS_ENV_FILE` that doesn't exist;
   - an output dir that exists but isn't a directory, or can't be created;
   - an `overrides.txt` that is malformed or can't be read;
   - an existing `musicians.md` or `youtubers.md` can't be read (permissions, a directory, not UTF-8). This is checked before the fetch, so it costs no API quota and opens no sign-in;
@@ -99,7 +103,7 @@ Exit codes:
   - a safety guard tripped: the empty-list guard (see [Safety](#safety)) or the drop guard (below);
   - a file can't be written.
 
-  In every case except the last, no files are touched. A write failure stops at the file that failed, but the other file may already have been replaced. Each file is replaced atomically, the pair is not, so the run can be left **half applied**. The error names the file that failed; fix the cause and rerun. With `--apply-overrides`, a moved line can end up in both files or, when moves go both ways, in neither. The error lists the lines to re-add by hand.
+  In every case except the last, no files are touched. A write has two phases. First every changed file is written to a temp file next to it; if that fails (disk full, permissions), the temp files are removed and no file is replaced. Then the temp files are renamed over the real files, one at a time. Each rename is atomic, the set is not, so a failure between them leaves the run **half applied**: some files replaced, others not. Either way the error names the file that failed; fix the cause and rerun. With `--apply-overrides` the renames are ordered so that every moved line is in at least one file at every point; after a failed rename a moved line can be in both. When lines move both ways there are three renames: the first file is put in place twice, the first time still holding the lines it gives away, so a failure on the last rename leaves both files replaced and those lines in both. On any write failure during a move, the error also prints each moved line in full. Rerun with `--apply-overrides` to finish the move: it drops a moved copy that is byte-identical to the line already in place (see [Overrides](#overrides) for the one case where both copies stay).
 
 **Drop guard.** A partial API result would mark every channel it left out as missing. So a run refuses, before it writes anything, when it would newly mark more than max(5, 20%) of the listed channels missing. It prints the count and the threshold and exits with code 2:
 
@@ -218,7 +222,7 @@ Pass `--apply-overrides` to have the tool do that move for you. It is opt-in and
 - A move is not a drop. The drop guard and the empty-list guard count a moved channel once, exactly as if it had stayed where it was.
 - If the same ID is on several lines (hand edits), every line that sits in the wrong file moves. The duplicate warning still prints.
 - **One exception to "nothing is deleted":** if a moved line is byte-identical to a line the other file already has (as this run writes it), the moved copy is dropped instead of appended, and the run prints a warning saying so. A line that differs in any byte (another name, another `[missing since …]` date) is never deleted; both stay and the duplicate warning prints.
-- **A failed write never loses a moved line.** Both files are fully written to temp files first, and only then put in place, so a disk-full or permission error while writing changes neither file. The two renames come last and are ordered so that every moved line is in at least one file at every point, even after a crash between them. When lines move both ways, this costs one extra rename of the first file. On a write failure the run exits with code 2, names the file that failed and prints every moved line in full, with the file it left and the file it joins, so a channel you no longer follow can be restored by hand if needed. Fix the cause and rerun with `--apply-overrides`: it finishes the move and drops the identical copies, leaving one copy of each line. If the rerun is on a later day, a channel that became unsubscribed in the failed run gets a different `[missing since …]` date, so both copies stay and the duplicate warning tells you to delete one.
+- **A failed write never loses a moved line.** Every changed file is fully written to a temp file first, and only then put in place, so a disk-full or permission error while writing changes no file. The renames come last and are ordered so that every moved line is in at least one file at every point, even after a crash between them. When lines move both ways, this takes three renames instead of two: the first file is put in place twice, the first time still holding the lines it gives away. On a write failure the run exits with code 2, names the file that failed and prints every moved line in full, with the file it left and the file it joins, so a channel you no longer follow can be restored by hand if needed. Fix the cause and rerun with `--apply-overrides`: it finishes the move and drops the identical copies, leaving one copy of each line. If the rerun is on a later day, a channel that became unsubscribed in the failed run gets a different `[missing since …]` date, so both copies stay and the duplicate warning tells you to delete one.
 
 ## Safety
 
