@@ -216,8 +216,9 @@ Pass `--apply-overrides` to have the tool do that move for you. It is opt-in and
   youtubers.md: 4 channels, +0 added, 0 newly missing, 1 still missing, 0 restored, 0 renamed, 1 moved in
   ```
 - A move is not a drop. The drop guard and the empty-list guard count a moved channel once, exactly as if it had stayed where it was.
-- If the same ID is on several lines (hand edits), every line that sits in the wrong file moves and none is deleted. The duplicate warning still prints.
-- The two files are replaced one after the other, not as a pair. The file that gains lines is written first, so if the second write fails the moved channel is in both files (the next run warns about the duplicate) and not in neither. Only when channels move in both directions in one run can a failed second write leave lines in neither file; the error then names those channel IDs.
+- If the same ID is on several lines (hand edits), every line that sits in the wrong file moves. The duplicate warning still prints.
+- **One exception to "nothing is deleted":** if a moved line is byte-identical to a line the other file already has (as this run writes it), the moved copy is dropped instead of appended, and the run prints a warning saying so. A line that differs in any byte (another name, another `[missing since …]` date) is never deleted; both stay and the duplicate warning prints.
+- **A failed write never loses a moved line.** Both files are fully written to temp files first, and only then put in place, so a disk-full or permission error while writing changes neither file. The two renames come last and are ordered so that every moved line is in at least one file at every point, even after a crash between them. When lines move both ways, this costs one extra rename of the first file. On a write failure the run exits with code 2, names the file that failed and prints every moved line in full, with the file it left and the file it joins, so a channel you no longer follow can be restored by hand if needed. Fix the cause and rerun with `--apply-overrides`: it finishes the move and drops the identical copies, leaving one copy of each line. If the rerun is on a later day, a channel that became unsubscribed in the failed run gets a different `[missing since …]` date, so both copies stay and the duplicate warning tells you to delete one.
 
 ## Safety
 

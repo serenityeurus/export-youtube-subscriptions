@@ -277,6 +277,75 @@ class AtomicWriteTests(unittest.TestCase):
                 os.replace = orig
             self.assertEqual(os.listdir(d), [])
 
+    # write_files (issue #14): stage every file, then rename them in order.
+
+    def test_write_files_keeps_each_mode_and_applies_repeated_paths_in_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = os.path.join(directory, "a.md"), os.path.join(directory, "b.md")
+            for path, mode in ((first, 0o644), (second, 0o640)):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("old\n")
+                os.chmod(path, mode)
+            steps = [(first, "mid\n"), (second, "old\n"), (first, "new\n"), (first, "new\n")]
+            self.assertEqual(eys.write_files(steps), [True, False, True, False])
+            self.assertEqual((eys.read_text(first), eys.read_text(second)), ("new\n", "old\n"))
+            self.assertEqual(stat.S_IMODE(os.stat(first).st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE(os.stat(second).st_mode), 0o640)
+            self.assertEqual(sorted(os.listdir(directory)), ["a.md", "b.md"])
+
+    def test_write_files_stages_everything_before_the_first_rename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = os.path.join(directory, "a.md"), os.path.join(directory, "b.md")
+            staged_before_replace = []
+
+            def counting_replace(source, target):
+                staged_before_replace.append(sorted(name for name in os.listdir(directory) if name.endswith(".tmp")))
+                return os.rename(source, target)
+
+            with mock.patch.object(eys.os, "replace", side_effect=counting_replace):
+                eys.write_files([(first, "a\n"), (second, "b\n")])
+            self.assertEqual([len(names) for names in staged_before_replace], [2, 1])
+
+    def test_write_files_failure_while_staging_touches_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = os.path.join(directory, "a.md"), os.path.join(directory, "b.md")
+            for path in (first, second):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("old\n")
+            real_chmod = os.chmod
+
+            def chmod_fails_second(path, mode, calls=[]):  # noqa: B006 - call counter
+                calls.append(path)
+                if len(calls) == 2:
+                    raise PermissionError(1, "Operation not permitted")
+                return real_chmod(path, mode)
+
+            with mock.patch.object(eys.os, "chmod", side_effect=chmod_fails_second), \
+                    self.assertRaises(eys.WriteError) as caught:
+                eys.write_files([(first, "a\n"), (second, "b\n")])
+            self.assertEqual(caught.exception.path, second)
+            self.assertIn("Operation not permitted", str(caught.exception))
+            self.assertEqual((eys.read_text(first), eys.read_text(second)), ("old\n", "old\n"))
+            self.assertEqual(sorted(os.listdir(directory)), ["a.md", "b.md"])
+
+    def test_write_files_failed_rename_keeps_earlier_steps_and_names_the_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = os.path.join(directory, "a.md"), os.path.join(directory, "b.md")
+            real_replace = os.replace
+
+            def second_replace_fails(source, target, calls=[]):  # noqa: B006 - call counter
+                calls.append(target)
+                if len(calls) == 2:
+                    raise OSError(28, "No space left on device")
+                return real_replace(source, target)
+
+            with mock.patch.object(eys.os, "replace", side_effect=second_replace_fails), \
+                    self.assertRaises(eys.WriteError) as caught:
+                eys.write_files([(first, "a\n"), (second, "b\n")])
+            self.assertEqual(caught.exception.path, second)
+            self.assertEqual(eys.read_text(first), "a\n")
+            self.assertEqual(sorted(os.listdir(directory)), ["a.md"])
+
 
 class _Req:
     def __init__(self, resp):
@@ -1532,10 +1601,11 @@ class Issue4CliTests(unittest.TestCase):
             self.assertEqual(self.snapshot(d), before)
 
     def test_write_failure_is_exit_2_not_a_traceback(self):
-        def refuse(path, text):
-            raise PermissionError(13, "Permission denied", path)
+        def refuse(steps):
+            path = steps[0][0]
+            raise eys.WriteError(path, PermissionError(13, "Permission denied", path))
 
-        original, eys.atomic_write = eys.atomic_write, refuse
+        original, eys.write_files = eys.write_files, refuse
         try:
             with tempfile.TemporaryDirectory() as d:
                 code, _, err = self.run_cli("--output-dir", d, youtube=FakeYouTube(2))
@@ -1543,7 +1613,7 @@ class Issue4CliTests(unittest.TestCase):
                 self.assertIn("cannot write", err)
                 self.assertEqual(os.listdir(d), [])
         finally:
-            eys.atomic_write = original
+            eys.write_files = original
 
     def test_missing_google_libraries_is_exit_2_with_install_hint(self):
         blocked = dict.fromkeys(GOOGLE_TOP_LEVEL)  # None in sys.modules makes the import fail
@@ -2067,7 +2137,7 @@ class Issue5DropGuardCliTests(unittest.TestCase):
     def test_refusal_never_calls_the_writer(self):
         with tempfile.TemporaryDirectory() as d:
             lines = self.seed(d)
-            with mock.patch.object(eys, "atomic_write") as writer, mock.patch.object(eys.os, "makedirs") as mkdirs:
+            with mock.patch.object(eys, "write_files") as writer, mock.patch.object(eys.os, "makedirs") as mkdirs:
                 code, _, _ = self.run_cli("--output-dir", d, fetch=self.subs(lines, 30))
             self.assertEqual(code, 2)
             writer.assert_not_called()
@@ -2209,52 +2279,52 @@ class Issue6ApplyOverridesMergeTests(unittest.TestCase):
 
     def test_without_the_flag_nothing_moves_and_the_warning_prints(self):
         plain = merge(self.existing(), self.SUBS, TODAY)
-        r = merge(self.existing(), self.SUBS, TODAY, {"UCteach": YOUTUBER})
-        self.assertEqual(r.contents, plain.contents)
-        self.assertEqual([s.moved for s in r.summary.values()], [[], []])
-        self.assertEqual(len(r.warnings), 1)
+        result = merge(self.existing(), self.SUBS, TODAY, {"UCteach": YOUTUBER})
+        self.assertEqual(result.contents, plain.contents)
+        self.assertEqual([file_summary.moved for file_summary in result.summary.values()], [[], []])
+        self.assertEqual(len(result.warnings), 1)
         for needle in ("UCteach", "musicians.md", "youtubers.md", "by hand", "--apply-overrides"):
-            self.assertIn(needle, r.warnings[0])
+            self.assertIn(needle, result.warnings[0])
 
     def test_move_appends_to_the_end_and_keeps_every_other_line(self):
         for cid, name, src, dst in (("UCteach", "Teacher", MUSICIAN, YOUTUBER), ("UCvlog", "Vlog", YOUTUBER, MUSICIAN)):
             with self.subTest(cid=cid):
                 plain = merge(self.existing(), self.SUBS, TODAY)
-                r = merge(self.existing(), self.SUBS, TODAY, {cid: dst}, apply_overrides=True)
+                result = merge(self.existing(), self.SUBS, TODAY, {cid: dst}, apply_overrides=True)
                 line = f"{URL}{cid} # {name}"
-                self.assertEqual(r.contents[src], [x for x in plain.contents[src] if x != line])
-                self.assertEqual(r.contents[dst], plain.contents[dst] + [line])
-                self.assertEqual(r.warnings, [])
-                self.assertEqual(r.summary[dst].moved, [cid])
-                self.assertEqual(r.summary[src].moved, [])
-                self.assertEqual((r.summary[src].total, r.summary[dst].total), (1, 3))
+                self.assertEqual(result.contents[src], [kept for kept in plain.contents[src] if kept != line])
+                self.assertEqual(result.contents[dst], plain.contents[dst] + [line])
+                self.assertEqual(result.warnings, [])
+                self.assertEqual(result.summary[dst].moved, [cid])
+                self.assertEqual(result.summary[src].moved, [])
+                self.assertEqual((result.summary[src].total, result.summary[dst].total), (1, 3))
 
     def test_moved_line_lands_after_new_channels(self):
         subs = self.SUBS + [ch("UCnew", "New")]
-        r = merge(self.existing(), subs, TODAY, {"UCteach": YOUTUBER}, apply_overrides=True)
-        self.assertEqual(r.contents[YOUTUBER][-2:], [f"{URL}UCnew # New", f"{URL}UCteach # Teacher"])
+        result = merge(self.existing(), subs, TODAY, {"UCteach": YOUTUBER}, apply_overrides=True)
+        self.assertEqual(result.contents[YOUTUBER][-2:], [f"{URL}UCnew # New", f"{URL}UCteach # Teacher"])
 
     def test_moves_in_both_directions_keep_file_order(self):
         overrides = {"UCband": YOUTUBER, "UCteach": YOUTUBER, "UCodd": MUSICIAN}
-        r = merge(self.existing(), self.SUBS, TODAY, overrides, apply_overrides=True)
-        self.assertEqual(r.contents[MUSICIAN], ["# Musicians", "", "a note", f"{URL}UCodd # Odd"])
+        result = merge(self.existing(), self.SUBS, TODAY, overrides, apply_overrides=True)
+        self.assertEqual(result.contents[MUSICIAN], ["# Musicians", "", "a note", f"{URL}UCodd # Odd"])
         self.assertEqual(
-            r.contents[YOUTUBER],
+            result.contents[YOUTUBER],
             ["# YouTubers", "", f"{URL}UCvlog # Vlog", f"{URL}UCband # Band", f"{URL}UCteach # Teacher"],
         )
-        self.assertEqual(r.summary[MUSICIAN].counts()["moved"], 1)
-        self.assertEqual(r.summary[YOUTUBER].counts()["moved"], 2)
+        self.assertEqual(result.summary[MUSICIAN].counts()["moved"], 1)
+        self.assertEqual(result.summary[YOUTUBER].counts()["moved"], 2)
 
     def test_missing_marker_and_stored_name_are_kept(self):
         existing = self.existing()
         existing[MUSICIAN][4] = f"{URL}UCteach # Old Teacher Name [missing since 2026-01-02]"
-        subs = [c for c in self.SUBS if c.id != "UCteach"]
-        r = merge(existing, subs, TODAY, {"UCteach": YOUTUBER}, apply_overrides=True)
-        self.assertEqual(r.contents[YOUTUBER][-1], f"{URL}UCteach # Old Teacher Name [missing since 2026-01-02]")
-        self.assertEqual(r.contents[MUSICIAN], existing[MUSICIAN][:4])
-        self.assertEqual(r.summary[YOUTUBER].still_missing, ["UCteach"])
-        self.assertEqual(r.summary[YOUTUBER].newly_missing, [])
-        self.assertEqual(r.summary[MUSICIAN].still_missing, [])
+        subs = [channel for channel in self.SUBS if channel.id != "UCteach"]
+        result = merge(existing, subs, TODAY, {"UCteach": YOUTUBER}, apply_overrides=True)
+        self.assertEqual(result.contents[YOUTUBER][-1], f"{URL}UCteach # Old Teacher Name [missing since 2026-01-02]")
+        self.assertEqual(result.contents[MUSICIAN], existing[MUSICIAN][:4])
+        self.assertEqual(result.summary[YOUTUBER].still_missing, ["UCteach"])
+        self.assertEqual(result.summary[YOUTUBER].newly_missing, [])
+        self.assertEqual(result.summary[MUSICIAN].still_missing, [])
 
     def test_moved_line_is_what_merge_would_have_written_in_place(self):
         cases = [
@@ -2269,21 +2339,21 @@ class Issue6ApplyOverridesMergeTests(unittest.TestCase):
                 existing = {MUSICIAN: [stored], YOUTUBER: [f"{URL}UCkeep # Keep"]}
                 subs = [ch("UCkeep", "Keep")] + ([ch("UCa", title)] if title else [])
                 in_place = merge(existing, subs, TODAY)
-                r = merge(existing, subs, TODAY, {"UCa": YOUTUBER}, apply_overrides=True)
+                result = merge(existing, subs, TODAY, {"UCa": YOUTUBER}, apply_overrides=True)
                 self.assertEqual(in_place.contents[MUSICIAN], [moved])
-                self.assertEqual(r.contents, {MUSICIAN: [], YOUTUBER: [f"{URL}UCkeep # Keep", moved]})
-                self.assertEqual(getattr(r.summary[YOUTUBER], stat_name), ["UCa"])
-                self.assertEqual(getattr(r.summary[MUSICIAN], stat_name), [])
+                self.assertEqual(result.contents, {MUSICIAN: [], YOUTUBER: [f"{URL}UCkeep # Keep", moved]})
+                self.assertEqual(getattr(result.summary[YOUTUBER], stat_name), ["UCa"])
+                self.assertEqual(getattr(result.summary[MUSICIAN], stat_name), [])
 
     def test_second_run_changes_nothing(self):
         existing = self.existing()
         existing[YOUTUBER].append(f"{URL}UCgone # Gone [missing since 2026-01-02]")
         overrides = {"UCband": YOUTUBER, "UCodd": MUSICIAN, "UCgone": MUSICIAN, "UCvlog": YOUTUBER}
         first = merge(existing, self.SUBS, TODAY, overrides, apply_overrides=True)
-        self.assertEqual(sum(len(s.moved) for s in first.summary.values()), 3)
+        self.assertEqual(sum(len(file_summary.moved) for file_summary in first.summary.values()), 3)
         second = merge(first.contents, self.SUBS, LATER, overrides, apply_overrides=True)
         self.assertEqual(second.contents, first.contents)
-        self.assertEqual([s.moved for s in second.summary.values()], [[], []])
+        self.assertEqual([file_summary.moved for file_summary in second.summary.values()], [[], []])
         self.assertEqual(second.warnings, [])
         # ...and dropping the flag afterwards is just as quiet.
         third = merge(first.contents, self.SUBS, LATER, overrides)
@@ -2291,8 +2361,10 @@ class Issue6ApplyOverridesMergeTests(unittest.TestCase):
 
     def test_move_into_a_file_that_does_not_exist_yet_adds_the_header(self):
         existing = {MUSICIAN: [], YOUTUBER: ["# YouTubers", "", f"{URL}UCa # Band"]}
-        r = merge(existing, [ch("UCa", "Band")], TODAY, {"UCa": MUSICIAN}, apply_overrides=True)
-        self.assertEqual(r.contents, {MUSICIAN: ["# Musicians", "", f"{URL}UCa # Band"], YOUTUBER: ["# YouTubers", ""]})
+        result = merge(existing, [ch("UCa", "Band")], TODAY, {"UCa": MUSICIAN}, apply_overrides=True)
+        self.assertEqual(
+            result.contents, {MUSICIAN: ["# Musicians", "", f"{URL}UCa # Band"], YOUTUBER: ["# YouTubers", ""]}
+        )
 
     def test_duplicated_id_moves_every_misplaced_line_and_is_stable(self):
         for src, dst in ((MUSICIAN, YOUTUBER), (YOUTUBER, MUSICIAN)):
@@ -2300,32 +2372,122 @@ class Issue6ApplyOverridesMergeTests(unittest.TestCase):
                 existing = {src: [f"{URL}UCa # One", "note", f"{URL}UCa # Two"], dst: [f"{URL}UCa # Three"]}
                 first = merge(existing, [], TODAY, {"UCa": dst}, allow_empty=True, apply_overrides=True)
                 self.assertEqual(first.contents[src], ["note"])
-                self.assertEqual([parse_line(x).name for x in first.contents[dst]], ["Three", "One", "Two"])
+                self.assertEqual([parse_line(line).name for line in first.contents[dst]], ["Three", "One", "Two"])
                 self.assertEqual(first.summary[dst].total + first.summary[src].total, 1)
                 self.assertEqual(first.summary[dst].moved, ["UCa"])
-                self.assertTrue(any("duplicate channel UCa" in w for w in first.warnings))
+                # The "(also in ...)" file is where the first line ends up, not
+                # where it was read (PR #13 review, test gap 1).
+                src_name, dst_name = eys.FILENAMES[src], eys.FILENAMES[dst]
+                if src == MUSICIAN:  # musicians.md is read first: "One" is seen first, in youtubers.md
+                    expected = [
+                        f"duplicate channel UCa in {src_name} (also in {dst_name}); moved to {dst_name}",
+                        f"duplicate channel UCa in {dst_name} (also in {dst_name}); left in place",
+                    ]
+                else:  # "Three" is seen first, in place in musicians.md
+                    expected = [f"duplicate channel UCa in {src_name} (also in {dst_name}); moved to {dst_name}"] * 2
+                self.assertEqual(first.warnings, expected)
                 second = merge(first.contents, [], TODAY, {"UCa": dst}, allow_empty=True, apply_overrides=True)
                 self.assertEqual(second.contents, first.contents)
                 self.assertEqual(second.summary[dst].moved, [])
+
+    # Issue #14, finding 2: a moved line identical to one already in the
+    # destination is dropped; a line that differs in any byte is kept.
+
+    def test_identical_line_already_in_the_destination_is_dropped(self):
+        for src, dst in ((MUSICIAN, YOUTUBER), (YOUTUBER, MUSICIAN)):
+            with self.subTest(src=src):
+                # What a one-way move whose second write failed leaves behind.
+                line = f"{URL}UCa # Band [missing since 2026-01-02]"
+                existing = {src: ["note", line], dst: [line, f"{URL}UCb # Other"]}
+                result = merge(existing, [ch("UCb", "Other")], TODAY, {"UCa": dst}, apply_overrides=True)
+                self.assertEqual(result.contents, {src: ["note"], dst: [line, f"{URL}UCb # Other"]})
+                self.assertEqual(result.summary[dst].moved, ["UCa"])
+                self.assertEqual((result.summary[dst].total, result.summary[src].total), (2, 0))
+                dropped = (
+                    f"UCa is already in {eys.FILENAMES[dst]} as an identical line; "
+                    "dropped the copy that was moved there"
+                )
+                self.assertEqual(result.warnings, [dropped])
+                self.assertEqual(result.moves, [(src, dst, line)])
+                second = merge(result.contents, [ch("UCb", "Other")], TODAY, {"UCa": dst}, apply_overrides=True)
+                self.assertEqual((second.contents, second.warnings), (result.contents, []))
+
+    def test_a_line_that_differs_in_any_byte_is_never_dropped(self):
+        stored = f"{URL}UCa # Band [missing since 2026-01-02]"
+        for variant in (
+            f"{URL}UCa # Band [missing since 2026-01-03]",  # other date
+            f"{URL}UCa # Band. [missing since 2026-01-02]",  # other name
+            f"{URL}UCa # band [missing since 2026-01-02]",  # case
+            f"{URL}UCa # Band",  # newly missing: rendered with today's date
+        ):
+            with self.subTest(variant=variant):
+                existing = {MUSICIAN: [variant], YOUTUBER: [stored]}
+                result = merge(existing, [], TODAY, {"UCa": YOUTUBER}, allow_empty=True, apply_overrides=True)
+                self.assertEqual(result.contents[MUSICIAN], [])
+                self.assertEqual(len(result.contents[YOUTUBER]), 2)
+                self.assertEqual(result.contents[YOUTUBER][0], stored)
+                self.assertTrue(any("duplicate channel UCa" in warning for warning in result.warnings))
+                self.assertFalse(any("dropped" in warning for warning in result.warnings))
+
+    def test_only_a_copy_already_in_place_is_dropped_not_other_moved_copies(self):
+        # Two identical misplaced lines both move: nothing in the destination
+        # held the line before, so neither is dropped (no-delete rule).
+        line = f"{URL}UCa # Band"
+        existing = {MUSICIAN: [line, line], YOUTUBER: ["# YouTubers"]}
+        result = merge(existing, [ch("UCa", "Band")], TODAY, {"UCa": YOUTUBER}, apply_overrides=True)
+        self.assertEqual(result.contents[YOUTUBER], ["# YouTubers", line, line])
+
+    def test_moves_list_every_moved_line_with_both_files(self):
+        overrides = {"UCband": YOUTUBER, "UCodd": MUSICIAN}
+        result = merge(self.existing(), self.SUBS, TODAY, overrides, apply_overrides=True)
+        self.assertEqual(
+            result.moves, [(MUSICIAN, YOUTUBER, f"{URL}UCband # Band"), (YOUTUBER, MUSICIAN, f"{URL}UCodd # Odd")]
+        )
+        self.assertEqual(merge(self.existing(), self.SUBS, TODAY, overrides).moves, [])
+
+    # Issue #14, finding 1: the order of the writes.
+
+    def test_plan_writes_without_moves_is_one_step_per_file(self):
+        result = merge(self.existing(), self.SUBS, TODAY)
+        self.assertEqual(eys.plan_writes(result), [(cat, result.contents[cat]) for cat in eys.CATEGORIES])
+
+    def test_plan_writes_one_way_writes_the_gaining_file_first(self):
+        for src, dst, cid in ((MUSICIAN, YOUTUBER, "UCteach"), (YOUTUBER, MUSICIAN, "UCvlog")):
+            with self.subTest(src=src):
+                result = merge(self.existing(), self.SUBS, TODAY, {cid: dst}, apply_overrides=True)
+                self.assertEqual(eys.plan_writes(result), [(dst, result.contents[dst]), (src, result.contents[src])])
+
+    def test_plan_writes_two_way_keeps_leaving_lines_until_the_other_file_has_them(self):
+        overrides = {"UCband": YOUTUBER, "UCteach": YOUTUBER, "UCodd": MUSICIAN}
+        result = merge(self.existing(), self.SUBS, TODAY, overrides, apply_overrides=True)
+        leaving = [f"{URL}UCband # Band", f"{URL}UCteach # Teacher"]
+        self.assertEqual(
+            eys.plan_writes(result),
+            [
+                (MUSICIAN, result.contents[MUSICIAN] + leaving),
+                (YOUTUBER, result.contents[YOUTUBER]),
+                (MUSICIAN, result.contents[MUSICIAN]),
+            ],
+        )
 
     def test_moved_channels_are_not_drops(self):
         # 12 active musicians all move: none is "newly missing", so the guard
         # (limit max(5, 20%)) stays quiet even with allow_drop off.
         lines = _listed(12, "UCm")
-        overrides = {parse_line(x).id: YOUTUBER for x in lines}
+        overrides = {parse_line(line).id: YOUTUBER for line in lines}
         existing = {MUSICIAN: ["# Musicians", ""] + lines, YOUTUBER: []}
-        r = merge(existing, _kept(lines, 0), TODAY, overrides, apply_overrides=True)
-        self.assertEqual(len(r.summary[YOUTUBER].moved), 12)
-        self.assertEqual(r.summary[YOUTUBER].newly_missing + r.summary[MUSICIAN].newly_missing, [])
-        self.assertEqual((r.summary[MUSICIAN].total, r.summary[YOUTUBER].total), (0, 12))
-        self.assertIsNone(eys.check_drop(r.summary))
+        result = merge(existing, _kept(lines, 0), TODAY, overrides, apply_overrides=True)
+        self.assertEqual(len(result.summary[YOUTUBER].moved), 12)
+        self.assertEqual(result.summary[YOUTUBER].newly_missing + result.summary[MUSICIAN].newly_missing, [])
+        self.assertEqual((result.summary[MUSICIAN].total, result.summary[YOUTUBER].total), (0, 12))
+        self.assertIsNone(eys.check_drop(result.summary))
 
     def test_drop_guard_counts_the_same_with_and_without_moves(self):
         # 30 active channels, limit 6. Moving channels must change neither side
         # of the comparison: 6 real drops pass, 7 are refused, moved or not.
         musicians, youtubers = _listed(10, "UCm"), _listed(20, "UCy")
         existing = {MUSICIAN: musicians, YOUTUBER: youtubers}
-        overrides = {parse_line(x).id: MUSICIAN for x in youtubers[:10]}  # 5 of them get dropped too
+        overrides = {parse_line(line).id: MUSICIAN for line in youtubers[:10]}  # 5 of them get dropped too
         for dropped, refused in ((6, False), (7, True)):
             with self.subTest(dropped=dropped):
                 subs = _kept(musicians, 0) + _kept(youtubers, dropped)
@@ -2344,10 +2506,10 @@ class Issue6ApplyOverridesMergeTests(unittest.TestCase):
         # 10 active + 20 old markers: limit is max(5, 2) = 5. Moving the 20
         # marked lines must not turn them into "active" and loosen the guard.
         active, marked = _listed(10, "UCm"), _listed(20, "UCy", "2026-01-02")
-        overrides = {parse_line(x).id: MUSICIAN for x in marked}
+        overrides = {parse_line(line).id: MUSICIAN for line in marked}
         existing = {MUSICIAN: active, YOUTUBER: marked}
-        r = merge(existing, _kept(active, 6), TODAY, overrides, allow_drop=True, apply_overrides=True)
-        tripped = eys.check_drop(r.summary)
+        result = merge(existing, _kept(active, 6), TODAY, overrides, allow_drop=True, apply_overrides=True)
+        tripped = eys.check_drop(result.summary)
         self.assertEqual((tripped.newly_missing, tripped.active, tripped.limit), (6, 10, 5))
 
     def test_empty_list_guard_still_fires_and_counts_each_channel_once(self):
@@ -2370,23 +2532,23 @@ class Issue6ApplyOverridesCliTests(unittest.TestCase):
             ("youtubers.md", self.YOUTUBERS),
             ("overrides.txt", "UCteach youtuber  # teaches, doesn't play\n"),
         ):
-            with open(os.path.join(directory, name), "w", encoding="utf-8") as f:
-                f.write(text)
+            with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+                handle.write(text)
         fixture = os.path.join(self.sandbox, "subs.json")
-        with open(fixture, "w", encoding="utf-8") as f:
-            json.dump([{"id": "UCband", "title": "Band"}, {"id": "UCvlog", "title": "Vlog"}], f)
+        with open(fixture, "w", encoding="utf-8") as handle:
+            json.dump([{"id": "UCband", "title": "Band"}, {"id": "UCvlog", "title": "Vlog"}], handle)
         return ("--output-dir", directory, "--from-json", fixture, "--date", TODAY)
 
     def test_flag_is_in_help(self):
         self.assertIn("--apply-overrides", eys.build_parser().format_help())
 
     def test_without_the_flag_output_and_files_are_unchanged(self):
-        with tempfile.TemporaryDirectory() as d:
-            argv = self.seed(d)
-            before = self.snapshot(d)
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed(directory)
+            before = self.snapshot(directory)
             code, out, err = self.run_cli(*argv)
             self.assertEqual((code, err), (0, ""))
-            self.assertEqual(self.snapshot(d), before)
+            self.assertEqual(self.snapshot(directory), before)
             self.assertIn("warning: override says UCteach is a youtuber but it is listed in musicians.md", out)
             self.assertNotIn("moved in", out)
             self.assertIn(
@@ -2394,11 +2556,11 @@ class Issue6ApplyOverridesCliTests(unittest.TestCase):
             )
 
     def test_move_then_second_run_is_byte_identical(self):
-        with tempfile.TemporaryDirectory() as d:
-            argv = self.seed(d)
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed(directory)
             code, out, err = self.run_cli(*argv, "--apply-overrides", "-v")
             self.assertEqual((code, err), (0, ""))
-            after = self.snapshot(d)
+            after = self.snapshot(directory)
             self.assertEqual(after["musicians.md"], f"# Musicians\n\n{URL}UCband # Band\nnote\n".encode())
             self.assertEqual(
                 after["youtubers.md"],
@@ -2411,92 +2573,151 @@ class Issue6ApplyOverridesCliTests(unittest.TestCase):
             self.assertIn("  youtubers.md moved in: UCteach\n", out)
             self.assertNotIn("warning", out)
 
-            mtimes = {name: os.stat(os.path.join(d, name)).st_mtime_ns for name in after}
+            mtimes = {name: os.stat(os.path.join(directory, name)).st_mtime_ns for name in after}
             code, out, err = self.run_cli(*argv, "--apply-overrides")
             self.assertEqual((code, err), (0, ""))
-            self.assertEqual(self.snapshot(d), after)
-            self.assertEqual({name: os.stat(os.path.join(d, name)).st_mtime_ns for name in after}, mtimes)
+            self.assertEqual(self.snapshot(directory), after)
+            self.assertEqual({name: os.stat(os.path.join(directory, name)).st_mtime_ns for name in after}, mtimes)
             self.assertEqual(out.count("0 moved in"), 2)
 
     def test_dry_run_reports_the_move_and_writes_nothing(self):
-        with tempfile.TemporaryDirectory() as d:
-            argv = self.seed(d)
-            before = self.snapshot(d)
-            with mock.patch.object(eys, "atomic_write") as writer:
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed(directory)
+            before = self.snapshot(directory)
+            with mock.patch.object(eys, "write_files") as writer:
                 code, out, err = self.run_cli(*argv, "--apply-overrides", "--dry-run")
             self.assertEqual((code, err), (0, ""))
             writer.assert_not_called()
-            self.assertEqual(self.snapshot(d), before)
+            self.assertEqual(self.snapshot(directory), before)
             self.assertIn("renamed, 0 moved in\nyoutubers.md: 2 channels", out)
             self.assertIn("0 renamed, 1 moved in\n", out)
             self.assertIn("dry run: no files written", out)
 
     def test_moves_do_not_trip_the_drop_guard_end_to_end(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as directory:
             lines = _listed(12, "UCm")
-            with open(os.path.join(d, "musicians.md"), "w", encoding="utf-8") as f:
-                f.write("\n".join(["# Musicians", "", *lines]) + "\n")
-            with open(os.path.join(d, "overrides.txt"), "w", encoding="utf-8") as f:
-                f.write("".join(f"{parse_line(x).id} youtuber\n" for x in lines))
+            with open(os.path.join(directory, "musicians.md"), "w", encoding="utf-8") as handle:
+                handle.write("\n".join(["# Musicians", "", *lines]) + "\n")
+            with open(os.path.join(directory, "overrides.txt"), "w", encoding="utf-8") as handle:
+                handle.write("".join(f"{parse_line(line).id} youtuber\n" for line in lines))
             code, out, err = self.run_cli(
-                "--output-dir", d, "--date", TODAY, "--apply-overrides", fetch=lambda: _kept(lines, 0)
+                "--output-dir", directory, "--date", TODAY, "--apply-overrides", fetch=lambda: _kept(lines, 0)
             )
             self.assertEqual((code, err), (0, ""))
             self.assertIn("youtubers.md: 12 channels, +0 added, 0 newly missing", out)
             self.assertIn("12 moved in", out)
-            self.assertEqual(self.snapshot(d)["musicians.md"], b"# Musicians\n\n")
-            self.assertEqual(self.snapshot(d)["youtubers.md"], ("\n".join(["# YouTubers", "", *lines]) + "\n").encode())
+            self.assertEqual(self.snapshot(directory)["musicians.md"], b"# Musicians\n\n")
+            expected = ("\n".join(["# YouTubers", "", *lines]) + "\n").encode()
+            self.assertEqual(self.snapshot(directory)["youtubers.md"], expected)
 
     def test_empty_list_guard_wins_over_the_flag(self):
-        with tempfile.TemporaryDirectory() as d:
-            argv = self.seed(d)
-            before = self.snapshot(d)
-            code, out, err = self.run_cli("--output-dir", d, "--apply-overrides", fetch=lambda: [])
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed(directory)
+            before = self.snapshot(directory)
+            code, out, err = self.run_cli("--output-dir", directory, "--apply-overrides", fetch=lambda: [])
             self.assertEqual((code, out), (2, ""))
             self.assertIn("files list 3 channel(s)", err)
-            self.assertEqual(self.snapshot(d), before)
+            self.assertEqual(self.snapshot(directory), before)
             del argv
 
-    def test_gaining_file_is_written_first(self):
-        # A crash between the two writes must leave the moved line in both
-        # files, never in neither: the file that gains it goes first.
-        with tempfile.TemporaryDirectory() as d:
-            argv = self.seed(d)
-            real_write, calls = eys.atomic_write, []
+    # Issue #14: a failed write during a move never loses a line.
 
-            def failing_second_write(path, text):
-                calls.append(os.path.basename(path))
-                if len(calls) == 2:
-                    raise OSError("disk full")
-                return real_write(path, text)
+    TEACH = f"{URL}UCteach # Teacher [missing since 2026-01-02]"  # unsubscribed: only the file has it
+    VLOG = f"{URL}UCvlog # Vlog"
+    SCENARIOS = {
+        "musicians to youtubers": ("UCteach youtuber\n", [TEACH]),
+        "youtubers to musicians": ("UCvlog musician\n", [VLOG]),
+        "both ways": ("UCteach youtuber\nUCvlog musician\n", [TEACH, VLOG]),
+    }
 
-            with mock.patch.object(eys, "atomic_write", side_effect=failing_second_write):
-                code, _, err = self.run_cli(*argv, "--apply-overrides")
-            self.assertEqual(code, 2)
-            self.assertEqual(calls, ["youtubers.md", "musicians.md"])
-            self.assertIn("cannot write", err)
-            after = self.snapshot(d)
+    def seed_scenario(self, directory, overrides):
+        argv = self.seed(directory)
+        with open(os.path.join(directory, "overrides.txt"), "w", encoding="utf-8") as handle:
+            handle.write(overrides)
+        return argv
+
+    def run_failing(self, argv, target, op_name, fail_at):
+        """Run with ``target.op_name`` raising ENOSPC on its ``fail_at``-th call."""
+        real_op, calls = getattr(target, op_name), []
+
+        def failing(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == fail_at:
+                raise OSError(28, "No space left on device")
+            return real_op(*args, **kwargs)
+
+        with mock.patch.object(target, op_name, side_effect=failing):
+            code, out, err = self.run_cli(*argv, "--apply-overrides")
+        failed = calls[fail_at - 1] if len(calls) >= fail_at else None
+        return code, out, err, failed
+
+    def test_injected_failure_at_any_step_never_leaves_a_moved_line_in_neither_file(self):
+        steps = ((eys.tempfile, "mkstemp"), (eys.os, "fsync"), (eys.os, "chmod"), (eys.os, "replace"))
+        for scenario, (overrides, moved) in self.SCENARIOS.items():
+            with tempfile.TemporaryDirectory() as directory:
+                argv = self.seed_scenario(directory, overrides)
+                self.assertEqual(self.run_cli(*argv, "--apply-overrides")[0], 0)
+                clean = self.snapshot(directory)
+            failed_replaces = set()
+            for (target, op_name), fail_at in [(step, count) for step in steps for count in range(1, 5)]:
+                with self.subTest(scenario=scenario, step=op_name, fail_at=fail_at), \
+                        tempfile.TemporaryDirectory() as directory:
+                    argv = self.seed_scenario(directory, overrides)
+                    before = self.snapshot(directory)
+                    code, _, err, failed = self.run_failing(argv, target, op_name, fail_at)
+                    after = self.snapshot(directory)
+                    self.assertEqual([name for name in os.listdir(directory) if name.endswith(".tmp")], [])
+                    files = after["musicians.md"].decode() + after["youtubers.md"].decode()
+                    for line in moved:
+                        self.assertIn(line + "\n", files)  # never in neither file
+                    if code == 0:  # no such call, or a swallowed directory fsync
+                        self.assertEqual(after, clean)
+                        continue
+                    self.assertEqual(code, 2)
+                    self.assertIn("error: cannot write", err)
+                    for line in moved:  # the full line, so it can be restored by hand
+                        self.assertIn(line, err)
+                    if op_name != "replace":  # failed while staging: nothing replaced
+                        self.assertEqual(after, before)
+                    else:
+                        failed_replaces.add(os.path.basename(failed[1]))
+                    # A rerun with the flag finishes the move: one copy of each line.
+                    code, out, err = self.run_cli(*argv, "--apply-overrides")
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertEqual(self.snapshot(directory), clean)
+            # The replace of the first and of the second file both failed once.
+            self.assertEqual(failed_replaces, {"musicians.md", "youtubers.md"}, scenario)
+
+    def test_one_way_second_write_fails_then_rerun_leaves_exactly_one_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed(directory)
+            code, _, err, failed = self.run_failing(argv, eys.os, "replace", 2)
+            self.assertEqual((code, os.path.basename(failed[1])), (2, "musicians.md"))
+            self.assertIn(f"error: cannot write {os.path.join(directory, 'musicians.md')!r}", err)
+            self.assertIn(f"error:   musicians.md -> youtubers.md: {self.TEACH}\n", err)
+            after = self.snapshot(directory)
             self.assertEqual(after["musicians.md"], self.MUSICIANS.encode())  # untouched: still has the line
-            self.assertIn(b"UCteach", after["youtubers.md"])
+            self.assertEqual(after["youtubers.md"].decode().count(self.TEACH), 1)
 
-    def test_two_way_move_failure_names_the_lines_that_did_not_land(self):
-        with tempfile.TemporaryDirectory() as d:
-            argv = self.seed(d)
-            with open(os.path.join(d, "overrides.txt"), "a", encoding="utf-8") as f:
-                f.write("UCvlog musician\n")
-            real_write, calls = eys.atomic_write, []
+            code, out, err = self.run_cli(*argv, "--apply-overrides")
+            self.assertEqual((code, err), (0, ""))
+            files = self.snapshot(directory)
+            self.assertEqual((files["musicians.md"] + files["youtubers.md"]).decode().count("UCteach"), 1)
+            self.assertIn(self.TEACH, files["youtubers.md"].decode())
+            self.assertIn("warning: UCteach is already in youtubers.md as an identical line", out)
+            self.assertNotIn("duplicate channel", out)
 
-            def failing_second_write(path, text):
-                calls.append(os.path.basename(path))
-                if len(calls) == 2:
-                    raise OSError("disk full")
-                return real_write(path, text)
-
-            with mock.patch.object(eys, "atomic_write", side_effect=failing_second_write):
-                code, _, err = self.run_cli(*argv, "--apply-overrides")
+    def test_write_failure_without_moves_lists_no_lines(self):
+        # PR #13 review, test gap 2: the move listing is only for runs that move.
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed_scenario(directory, "")
+            with open(os.path.join(directory, "youtubers.md"), "w", encoding="utf-8") as handle:
+                handle.write(f"{URL}UCvlog # Old Vlog Name\n")  # a rename, so the run writes
+            code, _, err, _ = self.run_failing(argv, eys.os, "replace", 1)
             self.assertEqual(code, 2)
-            self.assertIn(f"not moved into {os.path.join(d, calls[1])!r}", err)
-            self.assertIn("UCteach" if calls[1] == "youtubers.md" else "UCvlog", err)
+            self.assertIn("error: cannot write", err)
+            self.assertNotIn("--apply-overrides did not finish", err)
+            self.assertNotIn("->", err)
 
     def test_readme_documents_the_flag(self):
         with open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as f:

@@ -19,7 +19,7 @@ import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
@@ -101,6 +101,9 @@ class MergeResult:
     contents: Dict[str, List[str]]  # category -> lines (no newline chars)
     summary: Dict[str, FileSummary]
     warnings: List[str]
+    # --apply-overrides: (file it left, file it joins, rendered line) for every
+    # moved line, in the order read, including a copy dropped as a duplicate.
+    moves: List[Tuple[str, str, str]] = field(default_factory=list)
 
 
 class EmptySubscriptionsError(RuntimeError):
@@ -427,7 +430,11 @@ def merge(
         an absent channel, name refreshed for a subscribed one), so a second
         run finds nothing to move. All its stats, plus ``moved``, are counted
         in the file it moves to. Every line of a duplicated id that sits in
-        the wrong file moves; no line is ever deleted.
+        the wrong file moves. The one exception to "no line is ever deleted":
+        a moved line that is byte-identical to a line the destination already
+        holds in place is dropped instead of appended (a warning says so), so
+        a rerun after a half-applied move heals instead of doubling the line.
+        A line that differs in any byte is never deleted.
       * A channel id on several lines (hand edits): every line is updated and
         a warning emitted; summary stats count only the first occurrence.
       * Drop guard: raises DropGuardError when more than ``DROP_THRESHOLD``
@@ -454,6 +461,9 @@ def merge(
     contents: Dict[str, List[str]] = {}
     seen: Dict[str, str] = {}  # channel id -> category where first seen
     moved_lines: Dict[str, List[str]] = {cat: [] for cat in CATEGORIES}
+    moves: List[Tuple[str, str, str]] = []
+    # warnings index -> channel id, for duplicate warnings a dropped copy may heal
+    duplicate_warnings: Dict[int, str] = {}
 
     for cat in CATEGORIES:
         out: List[str] = []
@@ -472,6 +482,7 @@ def merge(
                 seen[p.id] = home
                 s.total += 1
             else:
+                duplicate_warnings[len(warnings)] = p.id
                 warnings.append(
                     f"duplicate channel {p.id} in {FILENAMES[cat]} "
                     f"(also in {FILENAMES[seen[p.id]]}); "
@@ -497,6 +508,7 @@ def merge(
                 # Counted even for a duplicate line (unlike the stats above):
                 # the file really does gain it.
                 moved_lines[home].append(rendered)
+                moves.append((cat, home, rendered))
                 s.moved.append(p.id)
                 continue
             out.append(rendered)
@@ -527,12 +539,38 @@ def merge(
         seen[ch.id] = cat
 
     # Moved lines go last, so they land at the very end of the target file.
+    # A moved line identical to one the target already holds in place is
+    # dropped (issue #14): that is the state a half-applied earlier move
+    # leaves, and appending it would double the line on every rerun. Only an
+    # exact match counts; anything else, even one byte off, is kept.
+    dropped_ids = set()
     for cat, lines_in in moved_lines.items():
         if not lines_in:
             continue
-        if not contents[cat]:
-            contents[cat].extend([HEADERS[cat], ""])  # target file didn't exist yet
-        contents[cat].extend(lines_in)
+        held = set(contents[cat])
+        for line in lines_in:
+            if line in held:
+                channel_id = parse_line(line).id
+                dropped_ids.add(channel_id)
+                warnings.append(
+                    f"{channel_id} is already in {FILENAMES[cat]} as an identical line; "
+                    "dropped the copy that was moved there"
+                )
+                continue
+            if not contents[cat]:
+                contents[cat].extend([HEADERS[cat], ""])  # target file didn't exist yet
+            contents[cat].append(line)
+
+    # A drop that leaves the channel on one line resolves its duplicate warning.
+    if dropped_ids:
+        line_counts: Dict[str, int] = {}
+        for lines in contents.values():
+            for line in lines:
+                parsed = parse_line(line)
+                if parsed is not None:
+                    line_counts[parsed.id] = line_counts.get(parsed.id, 0) + 1
+        healed = {cid for cid in dropped_ids if line_counts.get(cid) == 1}
+        warnings = [text for index, text in enumerate(warnings) if duplicate_warnings.get(index) not in healed]
 
     # A duplicated id (hand edit) must only be counted once per file.
     for s in summary.values():
@@ -545,7 +583,7 @@ def merge(
         tripped = check_drop(summary)
         if tripped:
             raise tripped
-    return MergeResult(contents=contents, summary=summary, warnings=warnings)
+    return MergeResult(contents=contents, summary=summary, warnings=warnings, moves=moves)
 
 
 # --------------------------------------------------------------------------
@@ -561,6 +599,18 @@ def read_text(path: str) -> str:
         return ""
 
 
+class WriteError(OSError):
+    """A step of ``write_files`` failed; ``path`` is the file it was writing."""
+
+    def __init__(self, path: str, cause: OSError):
+        super().__init__(cause.errno, cause.strerror or str(cause))
+        self.path = path
+        self.cause = cause
+
+    def __str__(self) -> str:
+        return str(self.cause)
+
+
 def atomic_write(path: str, text: str) -> bool:
     """Write ``text`` to ``path`` atomically. Returns False if content was unchanged.
 
@@ -568,34 +618,112 @@ def atomic_write(path: str, text: str) -> bool:
     either the old or the new file, never a truncated one. Existing file
     permissions are preserved; owner/group and extended attributes are not.
     """
-    # Write to the symlink target so a linked file (e.g. into a notes repo or
-    # dotfiles) stays a link instead of being replaced by a regular file.
-    path = os.path.realpath(path)
-    if os.path.exists(path) and read_text(path) == text:
-        return False
-    directory = os.path.dirname(path)
     try:
-        mode = os.stat(path).st_mode & 0o777
-    except FileNotFoundError:
-        umask = os.umask(0)  # mkstemp is 0600; new files get the usual 0666 & ~umask
-        os.umask(umask)
-        mode = 0o666 & ~umask
-    fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+        return write_files([(path, text)])[0]
+    except WriteError as e:
+        raise e.cause from None
+
+
+def write_files(steps: Sequence[Tuple[str, str]]) -> List[bool]:
+    """Apply ``(path, text)`` steps in order; return, per step, whether it wrote.
+
+    Two phases, so a set of files is as close to one write as a file system
+    allows (issue #14):
+
+    1. Stage: for every step that changes its file, a temp file in the same
+       directory is written, fsynced and given the file's mode. A failure here
+       (disk full, permissions) removes every temp file and leaves every
+       target untouched.
+    2. Commit: the temp files are renamed over their targets with os.replace,
+       in step order, the directory fsynced after each rename so the order
+       survives a crash. A failure here leaves the earlier steps applied and
+       the rest not, and removes the remaining temp files.
+
+    A path may appear in several steps; a step is compared with what the
+    step before it left, and skipped when equal. Callers order the steps so
+    that every prefix is a safe state (see ``plan_writes``). Any failure is
+    raised as WriteError naming the path. Each file is written through its
+    symlink, keeping the link.
+    """
+    expected: Dict[str, Optional[str]] = {}  # real path -> text it holds after the steps so far
+    modes: Dict[str, int] = {}
+    staged: List[Tuple[str, str, str]] = []  # (temp file, real path, path as given)
+    wrote: List[bool] = []
+    umask = os.umask(0)  # mkstemp is 0600; new files get the usual 0666 & ~umask
+    os.umask(umask)
+    current_path = ""
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-        _fsync_dir(directory)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
+        for path, text in steps:
+            current_path = path
+            # Write to the symlink target so a linked file (e.g. into a notes
+            # repo or dotfiles) stays a link instead of becoming a regular file.
+            real_path = os.path.realpath(path)
+            if real_path not in expected:
+                exists = os.path.exists(real_path)
+                expected[real_path] = read_text(real_path) if exists else None
+                try:
+                    modes[real_path] = os.stat(real_path).st_mode & 0o777
+                except FileNotFoundError:
+                    modes[real_path] = 0o666 & ~umask
+            if expected[real_path] == text:
+                wrote.append(False)
+                continue
+            fd, tmp = tempfile.mkstemp(
+                prefix=f".{os.path.basename(real_path)}.", suffix=".tmp", dir=os.path.dirname(real_path)
+            )
+            staged.append((tmp, real_path, path))
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, modes[real_path])
+            expected[real_path] = text
+            wrote.append(True)
+        while staged:
+            tmp, real_path, current_path = staged[0]
+            os.replace(tmp, real_path)
+            staged.pop(0)
+            _fsync_dir(os.path.dirname(real_path))
+    except BaseException as e:
+        for tmp, _, _ in staged:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+        if isinstance(e, OSError):
+            raise WriteError(current_path, e) from e
         raise
-    return True
+    return wrote
+
+
+def plan_writes(result: MergeResult) -> List[Tuple[str, List[str]]]:
+    """Order the ``(category, lines)`` writes for ``write_files``.
+
+    Without moves: one step per file. With --apply-overrides moves, the order
+    makes every prefix of the steps safe, so a failure (or a kill) after any
+    rename leaves each moved line in at least one file:
+
+    * A file that gains lines is written before one that only loses them, so
+      a one-way move is in both files, never neither, between the two.
+    * When lines move both ways, the file written first still loses lines to
+      a file not yet written. It is first written with its new content *plus*
+      the lines leaving it, then the other file, then its final content. One
+      extra write, only in this case. A rerun with the flag after a failure
+      in between moves those lines again and drops the identical copies.
+    """
+    order = sorted(CATEGORIES, key=lambda cat: not result.summary[cat].moved)
+    steps: List[Tuple[str, List[str]]] = []
+    deferred: List[str] = []
+    for index, cat in enumerate(order):
+        not_yet_written = order[index + 1 :]
+        leaving = [line for source, target, line in result.moves if source == cat and target in not_yet_written]
+        if leaving:
+            steps.append((cat, result.contents[cat] + leaving))
+            deferred.append(cat)
+        else:
+            steps.append((cat, result.contents[cat]))
+    steps.extend((cat, result.contents[cat]) for cat in deferred)
+    return steps
 
 
 def _fsync_dir(directory: str) -> None:
@@ -1217,32 +1345,30 @@ def main(
                 print(f"error: cannot create output dir {out_dir!r}: {e}", file=sys.stderr)
                 return 2
             created_dir = True
-        # Each file is replaced atomically, but the pair is not. A file that
-        # gains moved lines (--apply-overrides) is written first, so a failure
-        # between the two writes leaves a moved channel in both files (a
-        # duplicate the next run reports) rather than in neither. Moves in both
-        # directions at once can't be ordered that way; see the except below.
-        write_order = sorted(CATEGORIES, key=lambda cat: not result.summary[cat].moved)
-        wrote_any = False
-        for cat in write_order:
-            lines = result.contents[cat]
+        # Both files are staged before either is replaced, and the renames are
+        # ordered so a moved line is never in neither file (see plan_writes).
+        steps = []
+        for cat, lines in plan_writes(result):
             path = os.path.join(out_dir, FILENAMES[cat])
             if not lines and not os.path.exists(path):
                 continue  # don't create empty files
-            try:
-                wrote_any = atomic_write(path, join_lines(lines)) or wrote_any
-            except OSError as e:
-                # Say which one failed so a half-applied run is easy to spot.
-                print(f"error: cannot write {path!r}: {e}", file=sys.stderr)
-                moved_in = result.summary[cat].moved
-                if wrote_any and moved_in:
-                    # The other file was already rewritten without these lines.
-                    print(
-                        f"error: not moved into {path!r}, re-add by hand if now in neither file: "
-                        + ", ".join(moved_in),
-                        file=sys.stderr,
-                    )
-                return 2
+            steps.append((path, join_lines(lines)))
+        try:
+            write_files(steps)
+        except WriteError as e:
+            # Say which one failed so a half-applied run is easy to spot.
+            print(f"error: cannot write {e.path!r}: {e}", file=sys.stderr)
+            if result.moves:
+                # Full lines, not IDs: a channel you no longer follow can't be
+                # fetched again, so its stored name and date exist only here.
+                print(
+                    "error: --apply-overrides did not finish; each moved line is in at least one file, "
+                    "maybe both. Rerun with --apply-overrides to finish, or check these lines by hand:",
+                    file=sys.stderr,
+                )
+                for source, target, line in result.moves:
+                    print(f"error:   {FILENAMES[source]} -> {FILENAMES[target]}: {line}", file=sys.stderr)
+            return 2
 
     print(f"env file: {settings.env_file or 'none'}")
     note = ""
