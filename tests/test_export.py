@@ -2851,5 +2851,56 @@ class Issue11ReadmeTests(unittest.TestCase):
         self.assertIn("ssh -L 8765:localhost:8765", self.readme)
 
 
+class Issue17ReadmeTests(unittest.TestCase):
+    """README wording that must track write_files/plan_writes and main()."""
+
+    def setUp(self):
+        with open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as f:
+            self.readme = f.read()
+
+    def flat(self, start_marker, end_marker):
+        start = self.readme.index(start_marker)
+        return " ".join(self.readme[start:self.readme.index(end_marker, start)].split())
+
+    def write_failure_paragraph(self):
+        return self.flat("In every case except the last", "**Drop guard.**")
+
+    def test_write_failure_paragraph_has_no_lost_line_claim(self):
+        # Since #14 plan_writes keeps every moved line in at least one file.
+        paragraph = self.write_failure_paragraph().lower()
+        self.assertNotIn("in neither", paragraph)
+        self.assertNotIn("re-add", paragraph)
+
+    def test_write_failure_paragraph_matches_the_two_phases(self):
+        paragraph = self.write_failure_paragraph()
+        for needle in (
+            "neither file is replaced",  # staging failure
+            "half applied",  # rename failure
+            "in at least one file",
+            "Rerun with `--apply-overrides`",
+            "byte-identical",
+        ):
+            self.assertIn(needle, paragraph)
+
+    def test_exit_2_covers_an_unreadable_env_file(self):
+        bullet = next(line for line in self.readme.splitlines() if line.lstrip().startswith("- an env file"))
+        self.assertIn("can't be read", bullet)
+        self.assertIn("found automatically", bullet)
+
+    def test_headless_sign_in_has_the_busy_port_hint(self):
+        section = self.flat("### Headless sign-in", "Exit codes:")
+        self.assertIn("exits with code 1", section)
+        self.assertIn("Address already in use", section)
+        self.assertIn("both sides of the tunnel", section)
+
+    def test_hand_edits_during_sign_in_tradeoff_is_documented(self):
+        self.assertIn("the run overwrites those edits", " ".join(self.readme.split()))
+
+    def test_merge_docstring_compares_lines_as_rendered(self):
+        docstring = " ".join(eys.merge.__doc__.split())
+        self.assertIn("as rendered", docstring)
+        self.assertIn("as this run writes", docstring)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,8 @@ python3 export-youtube-subscriptions --output-dir ~/notes/youtube
 
 On the first run, a browser opens for Google sign-in. The token is cached at `~/.config/export-youtube-subscriptions/token.json` (or `$XDG_CONFIG_HOME/...`) with mode `600`. Use `--token PATH` to change the location.
 
+`musicians.md` and `youtubers.md` are read before the fetch and sign-in, and written after. If you edit them by hand while an interactive sign-in is waiting, the run overwrites those edits. Finish the sign-in first, then edit.
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--output-dir DIR` | `$EYS_OUTPUT_DIR`, else `.` | Where `musicians.md`, `youtubers.md` and `overrides.txt` live. Created if missing |
@@ -73,6 +75,8 @@ ssh -L 8765:localhost:8765 <host>
 
 Open the printed URL in the laptop's browser and sign in. The redirect to `localhost:8765` goes through the tunnel to the tool. Keep the SSH session open until the run prints its summary. This is needed only when there is no usable cached token. Later runs (including from cron) refresh the token without a browser.
 
+If the port is already in use on the host, the run exits with code 1 and an error ending in `Address already in use`. Pick another port and use it on both sides of the tunnel: in `ssh -L` and in `--auth-port`.
+
 Every run prints which env file was loaded, the resolved output directory and where it came from, then a summary for each file, for example:
 
 ```
@@ -89,7 +93,7 @@ Exit codes:
 - `1`: API, auth or network error (including a token refresh that fails on the network). No files are touched.
 - `2`: the run refused or failed. Every case:
   - a bad option, or a `--date` that isn't a real date as `YYYY-MM-DD`;
-  - an env file that is malformed, or that was named with `--env-file` or `$EYS_ENV_FILE` and doesn't exist;
+  - an env file that is malformed or can't be read (permissions, not UTF-8), including one found automatically, or that was named with `--env-file` or `$EYS_ENV_FILE` and doesn't exist;
   - an output dir that exists but isn't a directory, or can't be created;
   - an `overrides.txt` that is malformed or can't be read;
   - an existing `musicians.md` or `youtubers.md` can't be read (permissions, a directory, not UTF-8). This is checked before the fetch, so it costs no API quota and opens no sign-in;
@@ -99,7 +103,7 @@ Exit codes:
   - a safety guard tripped: the empty-list guard (see [Safety](#safety)) or the drop guard (below);
   - a file can't be written.
 
-  In every case except the last, no files are touched. A write failure stops at the file that failed, but the other file may already have been replaced. Each file is replaced atomically, the pair is not, so the run can be left **half applied**. The error names the file that failed; fix the cause and rerun. With `--apply-overrides`, a moved line can end up in both files or, when moves go both ways, in neither. The error lists the lines to re-add by hand.
+  In every case except the last, no files are touched. A write has two phases. First both files are written to temp files next to them; if that fails (disk full, permissions), the temp files are removed and neither file is replaced. Then the temp files are renamed over the real files, one at a time. Each rename is atomic, the pair is not, so a failure between them leaves the run **half applied**: one file replaced, the other not. Either way the error names the file that failed; fix the cause and rerun. With `--apply-overrides` the renames are ordered so that every moved line is in at least one file at every point; after a failed rename a moved line can be in both. The error then prints each moved line in full. Rerun with `--apply-overrides` to finish the move: it drops a moved copy that is byte-identical to the line already in place (see [Overrides](#overrides) for the one case where both copies stay).
 
 **Drop guard.** A partial API result would mark every channel it left out as missing. So a run refuses, before it writes anything, when it would newly mark more than max(5, 20%) of the listed channels missing. It prints the count and the threshold and exits with code 2:
 
