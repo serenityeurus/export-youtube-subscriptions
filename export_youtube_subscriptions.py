@@ -738,7 +738,7 @@ def _save_token(path: str, creds) -> None:
         f.write(creds.to_json())
 
 
-def get_credentials(client_secrets: str, token_path: str, open_browser: bool = True):
+def get_credentials(client_secrets: str, token_path: str, open_browser: bool = True, auth_port: int = 0):
     from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -769,12 +769,15 @@ def get_credentials(client_secrets: str, token_path: str, open_browser: bool = T
     except (OSError, ValueError, KeyError) as e:  # not JSON, or not a Desktop-app client file
         raise UsageError(f"cannot use OAuth client secrets {client_secrets!r}: {type(e).__name__}: {e}") from e
     # open_browser=False (--no-browser) makes the library print the URL instead.
-    creds = flow.run_local_server(port=0, open_browser=open_browser)
+    # Either way it then waits for Google's redirect on http://localhost:<port>;
+    # port 0 picks a random free one. On a headless host the browser runs on
+    # another machine, so --auth-port fixes the port for an `ssh -L` forward.
+    creds = flow.run_local_server(port=auth_port, open_browser=open_browser)
     _save_token(token_path, creds)
     return creds
 
 
-def build_youtube(client_secrets: str, token_path: str, open_browser: bool = True):
+def build_youtube(client_secrets: str, token_path: str, open_browser: bool = True, auth_port: int = 0):
     """Authenticate and build the real ``youtube`` v3 resource.
 
     The only place (with get_credentials) that imports the Google libraries,
@@ -783,7 +786,7 @@ def build_youtube(client_secrets: str, token_path: str, open_browser: bool = Tru
     try:
         from googleapiclient.discovery import build
 
-        creds = get_credentials(client_secrets, token_path, open_browser)
+        creds = get_credentials(client_secrets, token_path, open_browser, auth_port)
     except ImportError as e:
         raise UsageError(
             f"Google client libraries are not installed ({e}); run ./export-youtube-subscriptions "
@@ -793,12 +796,12 @@ def build_youtube(client_secrets: str, token_path: str, open_browser: bool = Tru
 
 
 def fetch_from_api(
-    client_secrets: str, token_path: str, open_browser: bool = True, youtube=None
+    client_secrets: str, token_path: str, open_browser: bool = True, youtube=None, auth_port: int = 0
 ) -> List[Channel]:
     """Fetch via the API. ``youtube`` injects a ready resource (tests use a
     fake); without it the real one is built, which authenticates first."""
     if youtube is None:
-        youtube = build_youtube(client_secrets, token_path, open_browser)
+        youtube = build_youtube(client_secrets, token_path, open_browser, auth_port)
     return fetch_channels(youtube)
 
 
@@ -1019,10 +1022,35 @@ def format_summary(result: MergeResult, dry_run: bool, show_moved: bool = False)
     return "\n".join(out)
 
 
+def _port(value: str) -> int:
+    """argparse type for --auth-port: 0 (random) or a TCP port 1-65535."""
+    try:
+        port = int(value)
+    except ValueError:
+        port = -1
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"must be a port number 0-65535, got {value!r}")
+    return port
+
+
+HELP_EPILOG = """\
+examples:
+  export-youtube-subscriptions --output-dir ~/notes/youtube
+  export-youtube-subscriptions --output-dir ~/notes/youtube --dry-run -v
+
+  # headless host: on your laptop run `ssh -L 8765:localhost:8765 <host>`,
+  # then in that session run the line below and open the printed URL locally
+  export-youtube-subscriptions --no-browser --auth-port 8765
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="export-youtube-subscriptions",
         description="Export your YouTube subscriptions to musicians.md and youtubers.md.",
+        epilog=HELP_EPILOG,
+        # Keeps the example lines as written; argument help is still wrapped.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
         "--output-dir",
@@ -1048,6 +1076,14 @@ def build_parser() -> argparse.ArgumentParser:
         "executable, else ~/.config/export-youtube-subscriptions/; must exist when given explicitly)",
     )
     p.add_argument("--no-browser", action="store_true", help="print the auth URL instead of opening a browser")
+    p.add_argument(
+        "--auth-port",
+        metavar="PORT",
+        type=_port,
+        default=0,
+        help="local port that receives Google's sign-in redirect (default: 0, a random free port); "
+        "set it on a headless host so it can be forwarded with ssh -L",
+    )
     p.add_argument("--dry-run", action="store_true", help="print the summary without writing files")
     p.add_argument(
         "--allow-empty",
@@ -1116,6 +1152,15 @@ def main(
     except OverridesError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    # Also before the fetch, so an unreadable file fails without spending quota
+    # or opening a browser sign-in. The files are then held in memory across
+    # the fetch: hand edits made to them during a slow interactive sign-in are
+    # overwritten by this run's write.
+    try:
+        existing = load_existing(out_dir)
+    except (OSError, UnicodeDecodeError) as e:  # unreadable, a directory, not UTF-8
+        print(f"error: cannot read the existing files in {out_dir!r}: {e}", file=sys.stderr)
+        return 2
 
     try:
         if fetch is not None:
@@ -1124,7 +1169,11 @@ def main(
             channels = load_json_channels(args.from_json)
         else:
             channels = fetch_from_api(
-                settings.client_secrets, settings.token_path, not args.no_browser, youtube=youtube
+                settings.client_secrets,
+                settings.token_path,
+                not args.no_browser,
+                youtube=youtube,
+                auth_port=args.auth_port,
             )
     except UsageError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -1133,11 +1182,6 @@ def main(
         print(f"error: failed to fetch subscriptions: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
-    try:
-        existing = load_existing(out_dir)
-    except (OSError, UnicodeDecodeError) as e:  # unreadable, a directory, not UTF-8
-        print(f"error: cannot read the existing files in {out_dir!r}: {e}", file=sys.stderr)
-        return 2
     try:
         result = merge(
             existing,

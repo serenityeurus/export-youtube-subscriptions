@@ -41,7 +41,7 @@ python3 -m pip install -r requirements.txt
 python3 export-youtube-subscriptions --output-dir ~/notes/youtube
 ```
 
-On the first run, a browser opens for Google sign-in. Use `--no-browser` on a headless host to have the URL printed instead. The token is cached at `~/.config/export-youtube-subscriptions/token.json` (or `$XDG_CONFIG_HOME/...`) with mode `600`. Use `--token PATH` to change the location.
+On the first run, a browser opens for Google sign-in. The token is cached at `~/.config/export-youtube-subscriptions/token.json` (or `$XDG_CONFIG_HOME/...`) with mode `600`. Use `--token PATH` to change the location.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -50,6 +50,7 @@ On the first run, a browser opens for Google sign-in. Use `--no-browser` on a he
 | `--token PATH` | `$EYS_TOKEN_PATH`, else `~/.config/export-youtube-subscriptions/token.json` | Cached OAuth token |
 | `--env-file PATH` | see [Env file](#env-file) | Settings file to read |
 | `--no-browser` | off | Print the auth URL instead of opening a browser |
+| `--auth-port PORT` | `0` | Local port that receives Google's sign-in redirect. `0` picks a random free port. Set it on a headless host (see [Headless sign-in](#headless-sign-in)) |
 | `--dry-run` | off | Compute and print the summary without writing anything |
 | `--allow-empty` | off | Accept an empty subscription list (see Safety). Implies `--allow-drop` |
 | `--allow-drop` | off | Let one run newly mark more than max(5, 20%) of the listed channels missing (see the drop guard under Exit codes) |
@@ -57,6 +58,20 @@ On the first run, a browser opens for Google sign-in. Use `--no-browser` on a he
 | `-v, --verbose` | off | List the channel IDs added, missing, restored, renamed or moved |
 | `--from-json PATH` | none | Read subscriptions from a JSON fixture instead of the API (for testing) |
 | `--date YYYY-MM-DD` | today | Date to use in new markers (for testing) |
+
+### Headless sign-in
+
+After sign-in, Google redirects the browser to `http://localhost:<port>/`, where the tool is waiting. `--no-browser` only prints the URL instead of opening it; the tool still waits on that port on the machine where it runs. On a headless host the browser is on another machine, so fix the port and forward it over SSH:
+
+```sh
+# on your laptop: open an SSH session that forwards the port
+ssh -L 8765:localhost:8765 <host>
+
+# in that session, on the host
+./export-youtube-subscriptions --no-browser --auth-port 8765
+```
+
+Open the printed URL in the laptop's browser and sign in. The redirect to `localhost:8765` goes through the tunnel to the tool. Keep the SSH session open until the run prints its summary. This is needed only when there is no usable cached token. Later runs (including from cron) refresh the token without a browser.
 
 Every run prints which env file was loaded, the resolved output directory and where it came from, then a summary for each file, for example:
 
@@ -70,9 +85,21 @@ youtubers.md: 3 channels, +0 added, 1 newly missing, 0 still missing, 0 restored
 
 Exit codes:
 
-- `0`: success
-- `1`: API, auth or network error. No files are touched.
-- `2`: usage or config error (bad or missing env file, output dir that can't be created), a bad `overrides.txt`, or a safety guard tripped (the empty-list guard or the drop guard). No files are touched.
+- `0`: success.
+- `1`: API, auth or network error (including a token refresh that fails on the network). No files are touched.
+- `2`: the run refused or failed. Every case:
+  - a bad option, or a `--date` that isn't a real date as `YYYY-MM-DD`;
+  - an env file that is malformed, or that was named with `--env-file` or `$EYS_ENV_FILE` and doesn't exist;
+  - an output dir that exists but isn't a directory, or can't be created;
+  - an `overrides.txt` that is malformed or can't be read;
+  - an existing `musicians.md` or `youtubers.md` can't be read (permissions, a directory, not UTF-8). This is checked before the fetch, so it costs no API quota and opens no sign-in;
+  - a `--from-json` fixture that is missing, isn't JSON or has the wrong shape;
+  - the Google client libraries are not installed (the message says how to install them);
+  - missing or invalid OAuth client secrets (no file, or not a Desktop-app client JSON) when a sign-in is needed;
+  - a safety guard tripped: the empty-list guard (see [Safety](#safety)) or the drop guard (below);
+  - a file can't be written.
+
+  In every case except the last, no files are touched. A write failure stops at the file that failed, but the other file may already have been replaced. Each file is replaced atomically, the pair is not, so the run can be left **half applied**. The error names the file that failed; fix the cause and rerun. With `--apply-overrides`, a moved line can end up in both files or, when moves go both ways, in neither. The error lists the lines to re-add by hand.
 
 **Drop guard.** A partial API result would mark every channel it left out as missing. So a run refuses, before it writes anything, when it would newly mark more than max(5, 20%) of the listed channels missing. It prints the count and the threshold and exits with code 2:
 

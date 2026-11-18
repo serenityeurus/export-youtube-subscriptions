@@ -40,6 +40,11 @@ def _read_bytes(path):
         return f.read()
 
 
+def _write_bytes(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
+
+
 def ch(cid, title, topic_ids=(), cats=()):
     return Channel(cid, title, list(topic_ids), list(cats))
 
@@ -423,19 +428,6 @@ class CliTests(unittest.TestCase):
             code, _, err = self.run_cli("--output-dir", d, fetch=lambda: [])
             self.assertEqual(code, 2)
             self.assertIn("overrides.txt:1", err)
-
-    def test_missing_client_secrets(self):
-        try:
-            import google_auth_oauthlib  # noqa: F401
-        except ImportError:
-            self.skipTest("google libs not installed")
-        with tempfile.TemporaryDirectory() as d:
-            code, _, err = self.run_cli(
-                "--output-dir", d, "--client-secrets", os.path.join(d, "nope.json"),
-                "--token", os.path.join(d, "token.json"),
-            )
-            self.assertEqual(code, 2)
-            self.assertIn("client secrets not found", err)
 
     # ---- env file integration -------------------------------------------
 
@@ -2511,6 +2503,131 @@ class Issue6ApplyOverridesCliTests(unittest.TestCase):
             readme = f.read()
         self.assertIn("| `--apply-overrides` |", readme)
         self.assertIn("moved in", readme)
+
+
+# ---- Issue #11: review follow-ups from #4 ----------------------------------
+
+
+class Issue11AuthPortTests(unittest.TestCase):
+    """--auth-port reaches flow.run_local_server, using the FakeGoogle stand-ins."""
+
+    READONLY = Issue4AuthTests.READONLY
+    setUp = Issue4AuthTests.setUp
+    install = Issue4AuthTests.install
+    credentials = Issue4AuthTests.credentials
+    run_cli = Issue4AuthTests.run_cli
+
+    def test_get_credentials_passes_the_port(self):
+        google = self.install(FakeGoogle())
+        self.credentials(open_browser=False, auth_port=8765)
+        self.assertEqual(google.calls[1], ("run_local_server", {"port": 8765, "open_browser": False}))
+
+    def test_cli_auth_port_reaches_run_local_server(self):
+        google = self.install(FakeGoogle(resource=FakeYouTube(1)))
+        code, _, err = self.run_cli("--client-secrets", self.secrets, "--no-browser", "--auth-port", "8765")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(google.calls[1], ("run_local_server", {"port": 8765, "open_browser": False}))
+
+    def test_cli_default_auth_port_is_0_random(self):
+        self.assertEqual(eys.build_parser().parse_args([]).auth_port, 0)
+        google = self.install(FakeGoogle(resource=FakeYouTube(1)))
+        code, _, _ = self.run_cli("--client-secrets", self.secrets)
+        self.assertEqual(code, 0)
+        self.assertEqual(google.calls[1], ("run_local_server", {"port": 0, "open_browser": True}))
+
+    def test_out_of_range_or_non_numeric_port_is_usage_error(self):
+        for bad in ("-1", "65536", "http", "", "80.5"):
+            with self.subTest(bad), redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as caught:
+                    eys.build_parser().parse_args(["--auth-port", bad])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("--auth-port", err.getvalue())
+        for good in ("0", "1", "8765", "65535"):
+            self.assertEqual(eys.build_parser().parse_args(["--auth-port", good]).auth_port, int(good))
+
+    def test_unreadable_existing_file_fails_before_auth(self):
+        # Real API path (no fetch/youtube injection): the Google stand-ins must
+        # never be asked for a token, a flow or a client.
+        google = self.install(FakeGoogle(resource=FakeYouTube(1)))
+        out_dir = os.path.join(self.sandbox, "out")
+        os.makedirs(out_dir)
+        with open(os.path.join(out_dir, "youtubers.md"), "wb") as f:
+            f.write(b"\xff not utf-8\n")
+        code, out, err = self.run_cli("--client-secrets", self.secrets, "--no-browser")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("cannot read the existing files", err)
+        self.assertEqual(google.calls, [])
+
+
+class Issue11CliTests(unittest.TestCase):
+    setUp, tearDown, run_cli = CliTests.setUp, CliTests.tearDown, CliTests.run_cli
+
+    def test_unreadable_existing_file_fails_before_fetch(self):
+        unreadable = {
+            "not utf-8": lambda path: _write_bytes(path, b"\xff\xfe\n"),
+            "a directory": os.mkdir,
+        }
+        for name, make in unreadable.items():
+            for filename in ("musicians.md", "youtubers.md"):
+                with self.subTest(name, file=filename), tempfile.TemporaryDirectory() as d:
+                    make(os.path.join(d, filename))
+                    fetch = mock.Mock(return_value=[ch("UCa", "A")])
+                    code, out, err = self.run_cli("--output-dir", d, fetch=fetch)
+                    self.assertEqual((code, out), (2, ""))
+                    self.assertIn("cannot read the existing files", err)
+                    fetch.assert_not_called()
+
+    def test_from_json_is_not_read_when_existing_file_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "musicians.md"))
+            with mock.patch.object(eys, "load_json_channels") as load_json:
+                code, _, _ = self.run_cli("--output-dir", d, "--from-json", os.path.join(d, "subs.json"))
+            self.assertEqual(code, 2)
+            load_json.assert_not_called()
+
+    def test_help_has_an_example_epilog(self):
+        parser = eys.build_parser()
+        self.assertTrue(parser.epilog)
+        text = parser.format_help()
+        self.assertIn("example", text.lower())
+        self.assertRegex(text, r"export-youtube-subscriptions --output-dir \S+")
+        self.assertIn("--no-browser --auth-port 8765", text)
+        # The example lines keep their layout instead of being re-wrapped.
+        self.assertRegex(text, r"\n  export-youtube-subscriptions --output-dir")
+
+    def test_help_documents_auth_port(self):
+        self.assertIn("--auth-port PORT", eys.build_parser().format_help())
+
+    def test_dead_skipped_client_secrets_test_is_gone(self):
+        self.assertFalse(hasattr(CliTests, "test_missing_client_secrets"))
+
+
+class Issue11ReadmeTests(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as f:
+            self.readme = f.read()
+
+    def exit_codes_section(self):
+        start = self.readme.index("Exit codes:")
+        return " ".join(self.readme[start:self.readme.index("**Drop guard.**", start)].split())
+
+    def test_exit_2_lists_every_case(self):
+        section = self.exit_codes_section()
+        for case in (
+            "Google client libraries are not installed",
+            "`--from-json`",
+            "`--date`",
+            "missing or invalid OAuth client secrets",
+            "existing `musicians.md` or `youtubers.md` can't be read",
+            "a file can't be written",
+            "half applied",
+        ):
+            self.assertIn(case, section)
+
+    def test_headless_sign_in_is_documented(self):
+        self.assertIn("| `--auth-port PORT` | `0`", self.readme)
+        self.assertIn("--no-browser --auth-port 8765", self.readme)
+        self.assertIn("ssh -L 8765:localhost:8765", self.readme)
 
 
 if __name__ == "__main__":
