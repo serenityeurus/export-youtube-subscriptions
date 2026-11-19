@@ -691,6 +691,11 @@ def write_files(steps: Sequence[Tuple[str, str]]) -> List[bool]:
                 os.unlink(tmp)
             except FileNotFoundError:
                 pass
+        if isinstance(e, UnicodeDecodeError):
+            # The re-read above: load_existing checked the file before the
+            # fetch, but it can stop being UTF-8 during a slow sign-in (#20).
+            reread_error = OSError(f"cannot re-read it as UTF-8 before writing: {e}")
+            raise WriteError(current_path, reread_error) from e
         if isinstance(e, OSError):
             raise WriteError(current_path, e) from e
         raise

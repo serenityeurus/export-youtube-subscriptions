@@ -101,7 +101,7 @@ Exit codes:
   - the Google client libraries are not installed (the message says how to install them);
   - missing or invalid OAuth client secrets (no file, or not a Desktop-app client JSON) when a sign-in is needed;
   - a safety guard tripped: the empty-list guard (see [Safety](#safety)) or the drop guard (below);
-  - a file can't be written.
+  - a file can't be written, including an existing file that became unreadable or not UTF-8 during the sign-in (each file is read again just before the write).
 
   In every case except the last, no files are touched. A write has two phases. First every changed file is written to a temp file next to it; if that fails (disk full, permissions), the temp files are removed and no file is replaced. Then the temp files are renamed over the real files, one at a time. Each rename is atomic, the set is not, so a failure between them leaves the run **half applied**: some files replaced, others not. Either way the error names the file that failed; fix the cause and rerun. With `--apply-overrides` the renames are ordered so that every moved line is in at least one file at every point; after a failed rename a moved line can be in both. When lines move both ways there are three renames: the first file is put in place twice, the first time still holding the lines it gives away, so a failure on the last rename leaves both files replaced and those lines in both. On any write failure during a move, the error also prints each moved line in full. Rerun with `--apply-overrides` to finish the move: it drops a moved copy that is byte-identical to the line already in place (see [Overrides](#overrides) for the one case where both copies stay).
 

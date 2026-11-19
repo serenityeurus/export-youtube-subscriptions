@@ -2984,5 +2984,109 @@ class Issue17BothWaysThirdRenameTests(unittest.TestCase):
             self.assertEqual(self.snapshot(directory), clean)
 
 
+
+class Issue20RereadBeforeWriteTests(unittest.TestCase):
+    """The write step re-reads each file to compare; that read can fail after
+    load_existing passed (the file changed during the sign-in wait). It is a
+    write failure like any other: exit 2, one error line, nothing replaced."""
+
+    setUp, tearDown, run_cli = CliTests.setUp, CliTests.tearDown, CliTests.run_cli
+    snapshot = Issue4CliTests.snapshot
+    MUSICIANS, YOUTUBERS = Issue6ApplyOverridesCliTests.MUSICIANS, Issue6ApplyOverridesCliTests.YOUTUBERS
+    TEACH = Issue6ApplyOverridesCliTests.TEACH
+    seed = Issue6ApplyOverridesCliTests.seed
+    NOT_UTF8 = b"\xff\xfe broken\n"
+
+    def fetch_then(self, argv, change):
+        """A fetch (the sign-in boundary) that runs ``change`` before returning."""
+        channels = eys.load_json_channels(argv[argv.index("--from-json") + 1])
+
+        def fetch():
+            change()
+            return channels
+
+        return fetch
+
+    def tmp_files(self, directory):
+        return [name for name in os.listdir(directory) if name.endswith(".tmp")]
+
+    def assert_clean_write_error(self, code, out, err, path):
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertNotIn("Traceback", err)
+        first, *rest = err.splitlines()
+        self.assertTrue(first.startswith(f"error: cannot write {path!r}: "), first)
+        return rest
+
+    def test_file_stops_being_utf8_during_sign_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed(directory)
+            youtubers = os.path.join(directory, "youtubers.md")
+            # Both files change; musicians.md is staged before youtubers.md is re-read.
+            fixture = argv[argv.index("--from-json") + 1]
+            with open(fixture, "w", encoding="utf-8") as handle:
+                json.dump([{"id": "UCvlog", "title": "Vlog"}, {"id": "UCnew", "title": "New - Topic"},
+                           {"id": "UCyt", "title": "Fresh vlog"}], handle)
+            before = self.snapshot(directory)
+            fetch = self.fetch_then(argv, lambda: _write_bytes(youtubers, self.NOT_UTF8))
+            with mock.patch.object(eys.tempfile, "mkstemp", wraps=eys.tempfile.mkstemp) as staging:
+                code, out, err = self.run_cli(*argv, fetch=fetch)
+            self.assertEqual(staging.call_count, 1)  # musicians.md was staged, then removed
+            rest = self.assert_clean_write_error(code, out, err, youtubers)
+            self.assertEqual(rest, [])  # one line
+            self.assertIn("UTF-8", err)
+            after = self.snapshot(directory)
+            self.assertEqual(after["youtubers.md"], self.NOT_UTF8)  # not replaced
+            self.assertEqual(after["musicians.md"], before["musicians.md"])
+            self.assertEqual(self.tmp_files(directory), [])
+
+    def test_during_a_move_the_moved_lines_are_printed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed(directory)
+            musicians = os.path.join(directory, "musicians.md")
+            before = self.snapshot(directory)
+            # youtubers.md gains the line so it is staged first; musicians.md's
+            # re-read then fails and the staged temp file must be removed.
+            fetch = self.fetch_then(argv, lambda: _write_bytes(musicians, self.NOT_UTF8))
+            code, out, err = self.run_cli(*argv, "--apply-overrides", fetch=fetch)
+            rest = self.assert_clean_write_error(code, out, err, musicians)
+            self.assertIn("error: --apply-overrides did not finish", rest[0])
+            self.assertEqual(rest[1:], [f"error:   musicians.md -> youtubers.md: {self.TEACH}"])
+            after = self.snapshot(directory)
+            self.assertEqual(after["musicians.md"], self.NOT_UTF8)
+            self.assertEqual(after["youtubers.md"], before["youtubers.md"])
+            self.assertEqual(self.tmp_files(directory), [])
+
+    def test_file_replaced_by_a_directory_during_sign_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed(directory)
+            youtubers = os.path.join(directory, "youtubers.md")
+
+            def to_directory():
+                os.unlink(youtubers)
+                os.mkdir(youtubers)
+
+            fetch = self.fetch_then(argv, to_directory)
+            code, out, err = self.run_cli(*argv, "--apply-overrides", fetch=fetch)
+            self.assert_clean_write_error(code, out, err, youtubers)
+            self.assertTrue(os.path.isdir(youtubers))
+            self.assertEqual(_read_bytes(os.path.join(directory, "musicians.md")), self.MUSICIANS.encode())
+            self.assertEqual(self.tmp_files(directory), [])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores file permissions")
+    def test_file_made_unreadable_during_sign_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            argv = self.seed(directory)
+            musicians = os.path.join(directory, "musicians.md")
+            fetch = self.fetch_then(argv, lambda: os.chmod(musicians, 0))
+            try:
+                code, out, err = self.run_cli(*argv, "--apply-overrides", fetch=fetch)
+            finally:
+                os.chmod(musicians, 0o644)
+            self.assert_clean_write_error(code, out, err, musicians)
+            self.assertEqual(_read_bytes(musicians), self.MUSICIANS.encode())
+            self.assertEqual(self.tmp_files(directory), [])
+
+
 if __name__ == "__main__":
     unittest.main()
